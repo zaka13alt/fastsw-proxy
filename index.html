@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FastSW</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0d12; --panel:#141824; --line:#252b3b; --txt:#e6e8ee; --dim:#8b93a7; --acc:#5b8cff; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; background:radial-gradient(1200px 600px at 50% -10%, #17203a, var(--bg)); color:var(--txt); font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
+    main { width:min(640px, 92vw); text-align:center; }
+    h1 { font-size:clamp(2.4rem,8vw,3.6rem); margin:0 0 .25rem; letter-spacing:-.03em; }
+    h1 span { color:var(--acc); }
+    p.sub { margin:0 0 1.75rem; color:var(--dim); }
+    form { display:flex; gap:.5rem; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:.5rem; }
+    form:focus-within { border-color:var(--acc); box-shadow:0 0 0 3px #5b8cff33; }
+    input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:inherit; font:inherit; padding:.6rem .75rem; }
+    button { background:var(--acc); color:#fff; border:0; border-radius:10px; padding:.6rem 1.1rem; font:inherit; font-weight:600; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:wait; }
+    #status { margin-top:1rem; min-height:1.5em; color:var(--dim); font-size:.9rem; }
+    #status.err { color:#ff7b7b; }
+    .quick { margin-top:1.25rem; display:flex; flex-wrap:wrap; gap:.5rem; justify-content:center; }
+    .quick a { color:var(--dim); text-decoration:none; border:1px solid var(--line); border-radius:999px; padding:.25rem .8rem; font-size:.85rem; }
+    .quick a:hover { color:var(--txt); border-color:var(--acc); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Fast<span>SW</span></h1>
+    <p class="sub">Service-worker web proxy · libcurl.js + Wisp</p>
+
+    <form id="f" autocomplete="off">
+      <input id="q" type="text" placeholder="Search or enter a URL" autofocus spellcheck="false">
+      <button id="go" type="submit" disabled>Go</button>
+    </form>
+    <div id="status">Starting service worker…</div>
+
+    <div class="quick">
+      <a href="#" data-u="https://duckduckgo.com">DuckDuckGo</a>
+      <a href="#" data-u="https://wikipedia.org">Wikipedia</a>
+      <a href="#" data-u="https://example.com">example.com</a>
+    </div>
+  </main>
+
+  <script src="/fastsw.all.js"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const status = $("status"), go = $("go"), q = $("q");
+
+    Fastsw.register()
+      .then(() => { status.textContent = "Ready."; go.disabled = false; })
+      .catch((e) => { status.textContent = e.message; status.className = "err"; });
+
+    $("f").addEventListener("submit", (e) => { e.preventDefault(); Fastsw.go(q.value); });
+    document.querySelectorAll(".quick a").forEach((a) =>
+      a.addEventListener("click", (e) => { e.preventDefault(); if (!go.disabled) Fastsw.go(a.dataset.u); }));
+  </script>
+</body>
+</html>
