@@ -19,10 +19,11 @@
   const CONFIG = {
     prefix: "/fastsw/service/",          // proxied URLs look like  /fastsw/service/<encodeURIComponent(url)>
     clientPath: "/fastsw/client.js",     // runtime injected into every proxied document
-    wisp: "wss://zakaon.top/wisp/",                         // e.g. "wss://your.host/wisp/"  (null = same host, /wisp/)
+    wisp: "wss://zakaon.top/wisp/",      // your Wisp server (null = same host, /wisp/)
     // Self-host these two files for production (CDN paths may change between releases).
     libcurlJS: "https://cdn.jsdelivr.net/npm/libcurl.js/libcurl.js",
     libcurlWasm: "https://cdn.jsdelivr.net/npm/libcurl.js/libcurl.wasm",
+    acornJS: "https://cdn.jsdelivr.net/npm/acorn@8/dist/acorn.js",   // real JS parser used for rewriting
     pageWebSocket: true,                 // inject libcurl.js into pages so WebSocket() goes through Wisp
   };
 
@@ -78,7 +79,197 @@
     const EVAL_RE = /(?<![\w$.])eval\s*\(/g;
     const DYN_IMPORT_RE = /(?<![\w$.])import\s*\(/g;
 
+    /* ---- AST rewriter (acorn): exact, scope-aware, position-based patching ---- */
+    const ID_NAMES = new Set(["location", "top", "parent", "eval", "Function"]);
+    const PROP_NAMES = new Set(["location", "top", "parent"]);
+    const FNT = new Set(["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"]);
+    const SKIPK = new Set(["type", "start", "end", "loc", "range"]);
+
+    function patNames(p, out) {
+      if (!p) return;
+      switch (p.type) {
+        case "Identifier": out.add(p.name); break;
+        case "ObjectPattern": p.properties.forEach((x) => patNames(x.type === "RestElement" ? x.argument : x.value, out)); break;
+        case "ArrayPattern": p.elements.forEach((e) => patNames(e, out)); break;
+        case "RestElement": patNames(p.argument, out); break;
+        case "AssignmentPattern": patNames(p.left, out); break;
+      }
+    }
+    function varNames(node, out) {
+      if (!node || typeof node.type !== "string") return;
+      if (node.type === "VariableDeclaration" && node.kind === "var") node.declarations.forEach((d) => patNames(d.id, out));
+      if (FNT.has(node.type) || node.type === "ClassBody") return;
+      for (const k in node) {
+        if (SKIPK.has(k)) continue;
+        const v = node[k];
+        if (Array.isArray(v)) v.forEach((c) => c && typeof c.type === "string" && varNames(c, out));
+        else if (v && typeof v.type === "string") varNames(v, out);
+      }
+    }
+    function lexNames(stmts, out) {
+      for (let s of stmts) {
+        if (!s) continue;
+        if ((s.type === "ExportNamedDeclaration" || s.type === "ExportDefaultDeclaration") && s.declaration) s = s.declaration;
+        if (s.type === "VariableDeclaration" && s.kind !== "var") s.declarations.forEach((d) => patNames(d.id, out));
+        else if ((s.type === "FunctionDeclaration" || s.type === "ClassDeclaration") && s.id) out.add(s.id.name);
+        else if (s.type === "ImportDeclaration") s.specifiers.forEach((x) => out.add(x.local.name));
+      }
+    }
+
+    function parseJS(src) {
+      const A = self.acorn;
+      if (!A) return null;
+      for (const sourceType of ["script", "module"]) {
+        try {
+          return A.parse(src, { ecmaVersion: "latest", sourceType, allowHashBang: true, allowReturnOutsideFunction: true,
+            allowAwaitOutsideFunction: true, allowImportExportEverywhere: true });
+        } catch (e) {}
+      }
+      return null;
+    }
+
     function rewriteJS(src, base) {
+      if (!src) return src;
+      src = String(src);
+      const ast = parseJS(src);
+      if (!ast) return rewriteJSLegacy(src, base);               // no parser / unparsable -> scanner fallback
+      const edits = [];
+      const edit = (s, e, t) => edits.push([s, e, t]);
+      const baseJSON = JSON.stringify(base);
+      const scopes = [];
+      const shadowed = (n) => scopes.some((s) => s.has(n));
+      const kids = (node, fn) => {
+        for (const k in node) {
+          if (SKIPK.has(k)) continue;
+          const v = node[k];
+          if (Array.isArray(v)) v.forEach((c) => c && typeof c.type === "string" && fn(c, k));
+          else if (v && typeof v.type === "string") fn(v, k);
+        }
+      };
+      const withScope = (set, fn) => { scopes.push(set); fn(); scopes.pop(); };
+
+      // patterns (declaration targets / destructuring): only expression parts + special keys are visited
+      function pat(p) {
+        if (!p) return;
+        switch (p.type) {
+          case "ObjectPattern":
+            for (const x of p.properties) {
+              if (x.type === "RestElement") { pat(x.argument); continue; }
+              if (x.computed) walk(x.key, x, "key");
+              else {
+                const nm = x.key.type === "Identifier" ? x.key.name : x.key.type === "Literal" ? x.key.value : null;
+                if (PROP_NAMES.has(nm)) edit(x.key.start, x.key.end, x.shorthand ? "fastsw$" + nm + ": " + nm : "fastsw$" + nm);
+              }
+              pat(x.value);
+            }
+            break;
+          case "ArrayPattern": p.elements.forEach(pat); break;
+          case "RestElement": pat(p.argument); break;
+          case "AssignmentPattern": pat(p.left); walk(p.right, p, "right"); break;
+          case "Identifier": break;
+          default: walk(p, null, "");                              // MemberExpression targets etc.
+        }
+      }
+
+      function walk(node, parent, key) {
+        if (!node) return;
+        switch (node.type) {
+          case "Program": {
+            const set = new Set(); varNames(node, set); lexNames(node.body, set);
+            return withScope(set, () => node.body.forEach((c) => walk(c, node, "body")));
+          }
+          case "FunctionDeclaration": case "FunctionExpression": case "ArrowFunctionExpression": {
+            const set = new Set();
+            node.params.forEach((p) => patNames(p, set));
+            if (node.type === "FunctionExpression" && node.id) set.add(node.id.name);
+            if (node.type !== "ArrowFunctionExpression") set.add("arguments");
+            if (node.body.type === "BlockStatement") { varNames(node.body, set); lexNames(node.body.body, set); }
+            return withScope(set, () => {
+              node.params.forEach(pat);
+              if (node.body.type === "BlockStatement") node.body.body.forEach((c) => walk(c, node.body, "body"));
+              else walk(node.body, node, "body");
+            });
+          }
+          case "BlockStatement": case "StaticBlock": {
+            const set = new Set(); lexNames(node.body, set);
+            return withScope(set, () => node.body.forEach((c) => walk(c, node, "body")));
+          }
+          case "SwitchStatement": {
+            walk(node.discriminant, node, "discriminant");
+            const set = new Set(); node.cases.forEach((c) => lexNames(c.consequent, set));
+            return withScope(set, () => node.cases.forEach((c) => { walk(c.test, c, "test"); c.consequent.forEach((s) => walk(s, c, "consequent")); }));
+          }
+          case "ForStatement": case "ForInStatement": case "ForOfStatement": {
+            const set = new Set(); const init = node.init || node.left;
+            if (init && init.type === "VariableDeclaration") lexNames([init], set);
+            return withScope(set, () => {
+              if (node.type === "ForStatement") { walk(node.init, node, "init"); walk(node.test, node, "test"); walk(node.update, node, "update"); }
+              else {
+                if (node.left.type === "VariableDeclaration" || node.left.type === "Identifier" || node.left.type === "MemberExpression") walk(node.left, node, "left"); else pat(node.left);
+                walk(node.right, node, "right");
+              }
+              walk(node.body, node, "body");
+            });
+          }
+          case "CatchClause": {
+            const set = new Set(); patNames(node.param, set);
+            return withScope(set, () => { pat(node.param); walk(node.body, node, "body"); });
+          }
+          case "VariableDeclarator": pat(node.id); return walk(node.init, node, "init");
+          case "AssignmentExpression":
+            if (node.left.type === "ObjectPattern" || node.left.type === "ArrayPattern") pat(node.left); else walk(node.left, node, "left");
+            return walk(node.right, node, "right");
+          case "ClassExpression": case "ClassDeclaration": {
+            const set = new Set(); if (node.id) set.add(node.id.name);
+            return withScope(set, () => { walk(node.superClass, node, "superClass"); walk(node.body, node, "body"); });
+          }
+          case "MethodDefinition": case "PropertyDefinition": case "Property":
+            if (node.computed) walk(node.key, node, "key");
+            if (node.type === "Property" && node.shorthand && node.value.type === "Identifier") {
+              const nm = node.value.name;
+              if (ID_NAMES.has(nm) && !shadowed(nm)) edit(node.start, node.end, nm + ": fastsw." + nm);
+              return;
+            }
+            return walk(node.value, node, "value");
+          case "LabeledStatement": return walk(node.body, node, "body");
+          case "BreakStatement": case "ContinueStatement": return;
+          case "ImportDeclaration": return edit(node.source.start, node.source.end, JSON.stringify(rewriteURL(node.source.value, base)));
+          case "ExportAllDeclaration": return node.source && edit(node.source.start, node.source.end, JSON.stringify(rewriteURL(node.source.value, base)));
+          case "ExportNamedDeclaration":
+            if (node.source) edit(node.source.start, node.source.end, JSON.stringify(rewriteURL(node.source.value, base)));
+            return node.declaration && walk(node.declaration, node, "declaration");
+          case "ImportExpression":
+            edit(node.start, node.source.start, `fastsw.import(${baseJSON},`);
+            walk(node.source, node, "source"); if (node.options) walk(node.options, node, "options");
+            return;
+          case "MetaProperty":
+            if (node.meta.name === "import") edit(node.start, node.end, "fastsw.meta(import.meta)");
+            return;
+          case "MemberExpression":
+            walk(node.object, node, "object");
+            if (!node.computed) {
+              if (PROP_NAMES.has(node.property.name)) edit(node.property.start, node.property.end, "fastsw$" + node.property.name);
+            } else if (node.property.type === "Literal" && typeof node.property.value === "string" && PROP_NAMES.has(node.property.value))
+              edit(node.property.start, node.property.end, JSON.stringify("fastsw$" + node.property.value));
+            else walk(node.property, node, "property");
+            return;
+          case "Identifier":
+            if (ID_NAMES.has(node.name) && !shadowed(node.name)) edit(node.start, node.end, "fastsw." + node.name);
+            return;
+        }
+        kids(node, (c, k) => walk(c, node, k));
+      }
+
+      walk(ast, null, "");
+      if (!edits.length) return src;
+      edits.sort((a, b) => b[0] - a[0]);
+      let out = src;
+      for (const [s, e, t] of edits) out = out.slice(0, s) + t + out.slice(e);
+      return out;
+    }
+
+    /* ---- legacy scanner (only used when acorn is missing or the source can't be parsed) ---- */
+    function rewriteJSLegacy(src, base) {
       if (!src) return src;
       const s = String(src), n = s.length;
 
@@ -180,7 +371,7 @@
     const ENT = { "&amp;": "&", "&quot;": '"', "&#39;": "'", "&apos;": "'", "&lt;": "<", "&gt;": ">" };
     const unent = (s) => s.replace(/&(?:amp|quot|#39|apos|lt|gt);/g, (m) => ENT[m]);
     const ent = (s) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-    const URL_ATTRS = new Set(["href", "src", "action", "poster", "data", "formaction", "background", "manifest", "ping", "cite", "longdesc", "codebase", "icon"]);
+    const URL_ATTRS = new Set(["href", "src", "action", "poster", "data", "formaction", "background", "manifest", "ping", "cite", "longdesc", "codebase", "icon", "xlink:href"]);
     const ATTR_RE = /([^\s"'<>\/=]+)(?:(\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
     const HTML_RE = /<!--[\s\S]*?-->|<(script|style)\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/\1\s*>|<([a-zA-Z][^\s\/>]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/gi;
 
@@ -196,7 +387,7 @@
         } else if (ln === "srcset" || ln === "imagesrcset") v = rewriteSrcset(unent(v), base);
         else if (ln === "style") v = rewriteCSS(unent(v), base);
         else if (/^on[a-z]+$/.test(ln)) v = rewriteJS(unent(v), base);
-        else if (ln === "srcdoc") v = rewriteHTML(unent(v), base, false);
+        else if (ln === "srcdoc") v = rewriteHTML(unent(v), base, true, {});
         else return m;
         return `${name}="${ent(v)}"`;
       });
@@ -246,6 +437,7 @@
         const bootJSON = JSON.stringify(boot || {}).replace(/</g, "\\u003c");
         const head =
           `<script>self.__fastswBoot=${bootJSON}</script>` +
+          `<script src="${cfg.acornJS}"></script>` +
           (cfg.pageWebSocket ? `<script src="${cfg.libcurlJS}"></script>` : "") +
           `<script src="${cfg.clientPath}"></script>`;
         const dm = /<!doctype[^>]*>/i.exec(html);
@@ -269,7 +461,13 @@
     const isWin = typeof document !== "undefined";
     const realLoc = G.location;
     const safe = (f, d) => { try { return f(); } catch (e) { return d; } };
-    const cur = () => { try { return new URL(core.decode(realLoc.pathname)); } catch (e) { return new URL("about:blank"); } };
+    const cur = () => {
+      if (realLoc.protocol === "about:") {                       // about:blank / about:srcdoc frames inherit the parent's page
+        try { if (G.parent !== G && G.parent.fastsw) return new URL(G.parent.fastsw.location.href); } catch (e) {}
+        return new URL("about:blank");
+      }
+      try { return new URL(core.decode(realLoc.pathname)); } catch (e) { return new URL("about:blank"); }
+    };
     const base = () => cur().href;
     const R = (u) => core.rewriteURL(u, base());
     const lurl = () => { const u = cur(); u.hash = realLoc.hash; return u; };
@@ -307,10 +505,24 @@
       get parent() { return safe(() => (G.parent !== G && isFast(G.parent) ? G.parent : G), G); },
       get self() { return G; },
       eval: (x) => (typeof x === "string" ? (0, G.eval)(core.rewriteJS(x, base())) : x),
-      import: (b, spec, ...rest) => import(core.rewriteURL(String(spec), b), ...rest),
+      import: (b, spec, opts) => (opts === undefined ? import(core.rewriteURL(String(spec), b)) : import(core.rewriteURL(String(spec), b), opts)),
+      meta: (m) => Object.assign({}, m, { url: core.unrewrite(m.url) }),
+      Function: new Proxy(Function, {
+        construct(t, a, nt) { if (a.length) a[a.length - 1] = core.rewriteJS(String(a[a.length - 1]), base()); return Reflect.construct(t, a, nt === undefined ? t : nt); },
+        apply(t, th, a) { if (a.length) a[a.length - 1] = core.rewriteJS(String(a[a.length - 1]), base()); return Reflect.apply(t, th, a); },
+      }),
       rewriteURL: R, unrewrite: core.unrewrite, core,
     };
     Object.defineProperty(G, "fastsw", { value: fastsw });
+
+    // give about:blank frames / popups the runtime too, otherwise a page could escape through them
+    const inject = (w) => {
+      try {
+        if (!w || w === G || w.fastsw || w.location.protocol !== "about:") return;
+        w.acorn = G.acorn; w.libcurl = G.libcurl;
+        w.eval("(" + fastswRuntime.toString() + ")(" + Core.toString() + "," + JSON.stringify(cfg) + ")");
+      } catch (e) {}
+    };
 
     /* ---------- fastsw$location / fastsw$top / fastsw$parent — the JS rewriter turns
        `x.location` into `x.fastsw$location`; for real windows/documents these return the dummies ---------- */
@@ -347,11 +559,21 @@
       const ob = G.navigator.sendBeacon;
       Navigator.prototype.sendBeacon = function (u, d) { return ob.call(this, R(u), d); };
     }
-    const ctor = (name) => {
+    const ctor = (name, worker) => {
       const O = G[name]; if (!O) return;
-      G[name] = new Proxy(O, { construct(t, a, nt) { if (a[0] != null && typeof a[0] !== "object" || a[0] instanceof URL) a[0] = R(String(a[0])); return Reflect.construct(t, a, nt); } });
+      G[name] = new Proxy(O, {
+        construct(t, a, nt) {
+          if ((a[0] != null && typeof a[0] !== "object") || a[0] instanceof URL) {
+            let u = R(String(a[0]));
+            if (worker && a[1] && a[1].type === "module" && u.startsWith(cfg.prefix)) u += (u.includes("?") ? "&" : "?") + "fastsw_module=1";
+            a[0] = u;
+          }
+          return Reflect.construct(t, a, nt === undefined ? t : nt);
+        },
+      });
     };
-    ["Worker", "SharedWorker", "EventSource"].forEach(ctor);
+    ["Worker", "SharedWorker"].forEach((n) => ctor(n, true));
+    ["EventSource", "Request", "Audio"].forEach((n) => ctor(n, false));
     if (!isWin && G.importScripts) { const oi = G.importScripts; G.importScripts = (...a) => oi.apply(G, a.map(R)); }
 
     // WebSockets go through libcurl.js -> Wisp
@@ -371,7 +593,7 @@
       const o = History.prototype[m];
       History.prototype[m] = function (s, t, u) { return o.call(this, s, t, u == null ? u : R(u)); };
     }
-    if (G.open) { const oo = G.open; G.open = function (u, ...r) { return oo.call(this, u ? R(u) : u, ...r); }; }
+    if (G.open) { const oo = G.open; G.open = function (u, ...r) { const w = oo.call(this, u ? R(u) : u, ...r); if (!u || /^about:blank$/i.test(u)) inject(w); return w; }; }
     if (G.postMessage && G.Window) {
       const pm = Window.prototype.postMessage;
       Window.prototype.postMessage = function (msg, a2, ...r) {
@@ -443,7 +665,15 @@
         get() { return core.unrewrite(d.get.call(this)); }, set(v) { d.set.call(this, R(v)); } });
     }
 
+    for (const C of [HTMLIFrameElement, G.HTMLFrameElement, G.HTMLObjectElement, G.HTMLEmbedElement]) {
+      if (!C) continue;
+      getter(C.prototype, "contentWindow", (w) => { inject(w); return w; });
+      getter(C.prototype, "contentDocument", (d) => { if (d) inject(d.defaultView); return d; });
+    }
+    getter(MessageEvent.prototype, "origin", (v) => (v === G.location.origin ? cur().origin : v));
+    for (const C of [HTMLImageElement, HTMLSourceElement]) setter(C.prototype, "srcset", (v) => core.rewriteSrcset(String(v), base()));
     const URLA = new Set(["href", "src", "action", "poster", "data", "formaction", "background", "manifest"]);
+    if (G.Attr) setter(Attr.prototype, "value", (v, a) => (URLA.has(a.name.toLowerCase()) ? R(v) : v));
     const E = Element.prototype, sa = E.setAttribute, ga = E.getAttribute;
     E.setAttribute = function (n, v) {
       const l = String(n).toLowerCase(); v = String(v);
@@ -529,7 +759,7 @@
   const IN_SW = typeof ServiceWorkerGlobalScope !== "undefined" && self instanceof ServiceWorkerGlobalScope;
 
   if (IN_SW) {
-    importScripts(CONFIG.libcurlJS);          // defines global `libcurl`
+    importScripts(CONFIG.libcurlJS, CONFIG.acornJS);   // define globals `libcurl` and `acorn`
 
     const core = FastswCore(CONFIG);
     const ORIGIN = self.location.origin;
@@ -589,11 +819,12 @@
       },
     };
 
-    const ready = (async () => {
+    let readyP = null;
+    const ensureReady = () => readyP || (readyP = (async () => {
       await libcurl.load_wasm(CONFIG.libcurlWasm);
       libcurl.set_websocket(WISP);
       await jar.load();
-    })();
+    })().catch((e) => { readyP = null; throw e; }));   // retry on next request if the wasm / Wisp setup failed
 
     /* ---------------- header policy ---------------- */
     const STRIP = new Set([
@@ -620,7 +851,7 @@
 
     /* ---------------- the proxy request ---------------- */
     async function proxy(req, target, page) {
-      await ready;
+      await ensureReady();
       const t = new URL(target);
       const h = {};
       for (const [k, v] of req.headers) if (!DROP_REQ.has(k)) h[k] = v;
@@ -670,10 +901,15 @@
       } else if (kind === "css") res = core.rewriteCSS(text, t.href);
       else {
         res = core.rewriteJS(text, t.href);
-        if (dest === "worker" || dest === "sharedworker")
-          res = `self.__fastswBoot={};importScripts(${JSON.stringify(CONFIG.clientPath)});` + res;
+        if (dest === "worker" || dest === "sharedworker") {
+          const A = JSON.stringify(CONFIG.acornJS), C = JSON.stringify(CONFIG.clientPath);
+          res = new URL(req.url).searchParams.has("fastsw_module")
+            ? `import ${A};import ${C};` + res                                   // module worker
+            : `self.__fastswBoot={};importScripts(${A},${C});` + res;           // classic worker
+        }
       }
-      out.set("content-type", ct.replace(/;\s*charset=[^;]*/i, "") + (kind === "html" && !ct ? "text/html" : "") + "; charset=utf-8");
+      const mime = ct.replace(/;\s*charset=[^;]*/i, "") || { html: "text/html", js: "text/javascript", css: "text/css" }[kind];
+      out.set("content-type", mime + "; charset=utf-8");
       return new Response(res, { status: r.status, statusText: r.statusText, headers: out });
     }
 
@@ -681,7 +917,7 @@
       const req = e.request, u = new URL(req.url);
       try {
         if (u.origin === ORIGIN && u.pathname === CONFIG.clientPath) return clientScript();
-        if (req.url === CONFIG.libcurlJS || req.url === CONFIG.libcurlWasm) return fetch(req);
+        if (req.url === CONFIG.libcurlJS || req.url === CONFIG.libcurlWasm || req.url === CONFIG.acornJS) return fetch(req);
 
         let target, page = null;
         const refStr = req.referrer && req.referrer.startsWith(ORIGIN + PREFIX) ? req.referrer : null;
