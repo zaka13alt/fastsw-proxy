@@ -621,7 +621,42 @@
       IDBFactory.prototype.deleteDatabase = function (n, ...a) { return id.call(this, pfx() + n, ...a); };
     }
 
-    if (!isWin) return;
+    /* ---------- anti-detection: make every patched function look native ----------
+       Google's "Search Guard" challenge (the page that says "If you're having trouble accessing Google
+       Search…", url has emsg=SG_REL) fingerprints the environment, including fn.toString() of natives like
+       fetch / XMLHttpRequest.open / document.cookie. Run once, after all patches are installed. */
+    const finish = () => {
+      safe(() => {
+        const FTS = Function.prototype.toString, masked = new WeakMap();
+        const NATIVE = /\{\s*\[native code\]\s*\}\s*$/;
+        const nat = (f, label) => {
+          if (typeof f !== "function" || masked.has(f)) return;
+          try { if (!NATIVE.test(FTS.call(f))) masked.set(f, `function ${label}() { [native code] }`); } catch (e) {}
+        };
+        const targets = [G, Object.prototype];
+        for (const n of ["Document", "Element", "Node", "HTMLElement", "ShadowRoot", "XMLHttpRequest", "History", "Navigator", "WorkerNavigator",
+          "CSSStyleDeclaration", "CSSStyleSheet", "IDBFactory", "MessageEvent", "Attr", "HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
+          "HTMLImageElement", "HTMLScriptElement", "HTMLStyleElement", "HTMLIFrameElement", "HTMLFrameElement", "HTMLMediaElement",
+          "HTMLSourceElement", "HTMLTrackElement", "HTMLEmbedElement", "HTMLObjectElement", "HTMLInputElement", "HTMLFormElement", "HTMLVideoElement"])
+          if (G[n] && G[n].prototype) targets.push(G[n].prototype);
+        for (const o of targets) {
+          for (const k of Reflect.ownKeys(o)) {
+            let d; try { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { continue; }
+            if (!d) continue;
+            const nm = typeof k === "symbol" ? `[${k.description}]` : k;
+            if (d.get) nat(d.get, "get " + nm);
+            if (d.set) nat(d.set, "set " + nm);
+            if (typeof d.value === "function" && k !== "constructor") nat(d.value, nm);
+          }
+        }
+        const fts = { toString() { const m = masked.get(this); return m !== undefined ? m : FTS.call(this); } }.toString;
+        masked.set(fts, "function toString() { [native code] }");
+        Object.defineProperty(Function.prototype, "toString", { value: fts, writable: true, configurable: true, enumerable: false });
+      });
+      safe(() => { delete G.__fastswBoot; });
+    };
+
+    if (!isWin) { finish(); return; }
 
     /* ---------- DOM ---------- */
     const getter = (proto, prop, fn) => {
@@ -765,6 +800,7 @@
       const px = mkStore(real);
       safe(() => Object.defineProperty(G, n, { get: () => px, configurable: true }));
     }
+    finish();
   }
 
   /* ================================================================== *
@@ -797,8 +833,8 @@
     const jar = {
       map: new Map(),
       timer: 0,
-      persist() { clearTimeout(this.timer); this.timer = setTimeout(() => idb("readwrite", (s) => s.put([...this.map], "cookies")).catch(() => {}), 500); },
-      async load() { try { const a = await idb("readonly", (s) => s.get("cookies")); if (a) this.map = new Map(a); } catch (e) {} },
+      persist() { clearTimeout(this.timer); this.timer = setTimeout(() => idb("readwrite", (s) => s.put([...this.map], "cookies")).catch(() => {}), 100); },
+      async load() { try { const a = await idb("readonly", (s) => s.get("cookies")); if (a) for (const [k, c] of a) if (!this.map.has(k)) this.map.set(k, c); } catch (e) {} },   // merge: never drop cookies set before the load finished
       set(url, line) {
         const u = new URL(url);
         const [nv, ...attrs] = String(line).split(";");
@@ -911,13 +947,15 @@
 
       const out = new Headers();
       const raw = r.raw_headers || Array.from(r.headers.entries());
+      let sawCookie = false;
       for (const [k, v] of raw) {
         const lk = k.toLowerCase();
-        if (lk === "set-cookie") { jar.set(t.href, v); continue; }
+        if (lk === "set-cookie") { sawCookie = true; jar.set(t.href, v); continue; }
         if (STRIP.has(lk)) continue;
         if (lk === "location") { out.set("location", core.rewriteURL(v, t.href)); continue; }
         out.append(k, v);
       }
+      if (!sawCookie && r.headers && typeof r.headers.getSetCookie === "function") r.headers.getSetCookie().forEach((c) => jar.set(t.href, c));
       out.set("access-control-allow-origin", ORIGIN);
       out.set("access-control-allow-credentials", "true");
 
