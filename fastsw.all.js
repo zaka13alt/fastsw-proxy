@@ -500,7 +500,8 @@
     /* ---------- fastsw object: dummy top / parent / location so pages can't bust out ---------- */
     const isFast = (w) => safe(() => !!w.fastsw, false);
     const fastsw = {
-      location: L,
+      get location() { return L; },
+      set location(v) { L.href = v; },            // bare `location = "..."` in page scripts must navigate, not clobber the dummy
       get top() { let w = G; safe(() => { while (w.parent !== w && isFast(w.parent)) w = w.parent; }); return w; },
       get parent() { return safe(() => (G.parent !== G && isFast(G.parent) ? G.parent : G), G); },
       get self() { return G; },
@@ -924,6 +925,10 @@
 
         if (u.origin === ORIGIN && u.pathname.startsWith(PREFIX)) {
           target = core.decode(u.pathname);
+          // A GET <form> submit (e.g. Google's search box) replaces the query of its action URL, so the
+          // browser sends  /fastsw/service/<enc(action)>?q=foo . The real query lives in u.search; the
+          // encoded target never has its own "?" (encodeURIComponent turns it into %3F), so just swap it in.
+          if (u.search) { try { const tu = new URL(target); tu.search = u.search; target = tu.href; } catch (err) {} }
           if (refStr) page = core.decode(new URL(refStr).pathname);
         } else {
           // request escaped the rewriter: resolve it against whichever proxied page made it
