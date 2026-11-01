@@ -595,13 +595,21 @@
       History.prototype[m] = function (s, t, u) { return o.call(this, s, t, u == null ? u : R(u)); };
     }
     if (G.open) { const oo = G.open; G.open = function (u, ...r) { const w = oo.call(this, u ? R(u) : u, ...r); if (!u || /^about:blank$/i.test(u)) inject(w); return w; }; }
-    if (G.postMessage && G.Window) {
-      const pm = Window.prototype.postMessage;
-      Window.prototype.postMessage = function (msg, a2, ...r) {
-        if (typeof a2 === "string" && a2 !== "/") a2 = "*";
-        else if (a2 && typeof a2 === "object" && a2.targetOrigin) a2 = { ...a2, targetOrigin: "*" };
-        return pm.call(this, msg, a2, ...r);
+    // postMessage masking. Every proxied site really lives on ONE origin (the proxy's), so a page that posts
+    // to e.g. "https://platform.twitter.com" would throw "target origin does not match the recipient's origin".
+    // NOTE: postMessage is an OWN property of each window instance ([Global] interface), not on
+    // Window.prototype, so it has to be wrapped on the window object itself (each frame wraps its own,
+    // which is also what runs when another frame calls  frame.postMessage(...)).
+    if (isWin && typeof G.postMessage === "function") {
+      const nativePM = G.postMessage;
+      const wrapped = function postMessage(...a) {
+        if (typeof a[1] === "string") a[1] = "*";                                              // (msg, targetOrigin[, transfer])
+        else if (a[1] && typeof a[1] === "object" && !Array.isArray(a[1]) && "targetOrigin" in a[1]) a[1] = { ...a[1], targetOrigin: "*" }; // (msg, {targetOrigin, transfer})
+        return nativePM.apply(this === undefined || this === null ? G : this, a);
       };
+      safe(() => Object.defineProperty(wrapped, "toString", { value: () => "function postMessage() { [native code] }" }));
+      safe(() => Object.defineProperty(G, "postMessage", { value: wrapped, writable: true, configurable: true, enumerable: true }));
+      if (G.postMessage !== wrapped) safe(() => { G.postMessage = wrapped; });
     }
     // sites must not register their own service workers (would fight ours)
     safe(() => { delete (isWin ? Navigator : WorkerNavigator).prototype.serviceWorker; });
@@ -671,7 +679,12 @@
       getter(C.prototype, "contentWindow", (w) => { inject(w); return w; });
       getter(C.prototype, "contentDocument", (d) => { if (d) inject(d.defaultView); return d; });
     }
-    getter(MessageEvent.prototype, "origin", (v) => (v === G.location.origin ? cur().origin : v));
+    // event.origin must be the SENDER's site origin (not the proxy's, and not the receiver's own)
+    getter(MessageEvent.prototype, "origin", (v, ev) => {
+      if (v !== G.location.origin) return v;
+      try { const s = ev.source; if (s && s.fastsw) return s.fastsw.location.origin; } catch (e) {}
+      return cur().origin;
+    });
     for (const C of [HTMLImageElement, HTMLSourceElement]) setter(C.prototype, "srcset", (v) => core.rewriteSrcset(String(v), base()));
     const URLA = new Set(["href", "src", "action", "poster", "data", "formaction", "background", "manifest"]);
     if (G.Attr) setter(Attr.prototype, "value", (v, a) => (URLA.has(a.name.toLowerCase()) ? R(v) : v));
