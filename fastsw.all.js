@@ -19,7 +19,7 @@
   const CONFIG = {
     prefix: "/fastsw/service/",          // proxied URLs look like  /fastsw/service/<encodeURIComponent(url)>
     clientPath: "/fastsw/client.js",     // runtime injected into every proxied document
-    wisp: wss://zakaon.top/wisp/,                          // e.g. "wss://your.host/wisp/"  (null = same host, /wisp/)
+    wisp: "wss://zakaon.top/wisp/",                         // e.g. "wss://your.host/wisp/"  (null = same host, /wisp/)
     // Self-host these two files for production (CDN paths may change between releases).
     libcurlJS: "https://cdn.jsdelivr.net/npm/libcurl.js/libcurl.js",
     libcurlWasm: "https://cdn.jsdelivr.net/npm/libcurl.js/libcurl.wasm",
