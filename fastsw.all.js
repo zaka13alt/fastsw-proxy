@@ -856,7 +856,36 @@
       const t = new URL(target);
       const h = {};
       for (const [k, v] of req.headers) if (!DROP_REQ.has(k)) h[k] = v;
-      h["user-agent"] = h["user-agent"] || self.navigator.userAgent;
+      // A service worker never sees the headers the browser adds itself (UA client hints, Accept-Language,
+      // Sec-Fetch-*), so libcurl would send a bare request and Google would answer with its "old browser /
+      // no JavaScript" page. Rebuild the headers a real Chrome navigation/fetch would have sent.
+      const nav = req.mode === "navigate";
+      const dflt = (k, v) => { if (v != null && !(k in h)) h[k] = v; };
+      const nv = self.navigator, uaStr = nv.userAgent, uad = nv.userAgentData;
+      dflt("user-agent", uaStr);
+      dflt("accept", nav ? "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" : "*/*");
+      dflt("accept-language", (nv.languages && nv.languages.length ? nv.languages : [nv.language || "en-US"]).map((l, i) => (i ? `${l};q=${Math.max(0.1, 1 - i * 0.1).toFixed(1)}` : l)).join(","));
+      const cm = /Chrom(?:e|ium)\/(\d+)/.exec(uaStr);
+      if (uad && uad.brands && uad.brands.length) {
+        dflt("sec-ch-ua", uad.brands.map((b) => `"${b.brand}";v="${b.version}"`).join(", "));
+        dflt("sec-ch-ua-mobile", uad.mobile ? "?1" : "?0");
+        dflt("sec-ch-ua-platform", `"${uad.platform || "Windows"}"`);
+      } else if (cm) {
+        dflt("sec-ch-ua", `"Chromium";v="${cm[1]}", "Not.A/Brand";v="24", "Google Chrome";v="${cm[1]}"`);
+        dflt("sec-ch-ua-mobile", /Mobile/i.test(uaStr) ? "?1" : "?0");
+        dflt("sec-ch-ua-platform", `"${/Windows/.test(uaStr) ? "Windows" : /Mac OS/.test(uaStr) ? "macOS" : /Android/.test(uaStr) ? "Android" : /CrOS/.test(uaStr) ? "Chrome OS" : "Linux"}"`);
+      }
+      let site = "none";
+      if (page) {
+        try {
+          const pu = new URL(page), reg = (x) => x.hostname.split(".").slice(-2).join(".");
+          site = pu.origin === t.origin ? "same-origin" : reg(pu) === reg(t) ? "same-site" : "cross-site";
+        } catch (e) { site = "cross-site"; }
+      }
+      dflt("sec-fetch-dest", nav ? "document" : req.destination || "empty");
+      dflt("sec-fetch-mode", req.mode === "same-origin" ? "cors" : req.mode);
+      dflt("sec-fetch-site", site);
+      if (nav) { dflt("sec-fetch-user", "?1"); dflt("upgrade-insecure-requests", "1"); }
       if (page) {
         h.referer = page;
         if ((req.method !== "GET" && req.method !== "HEAD") || req.headers.has("origin")) h.origin = new URL(page).origin;
