@@ -176,6 +176,7 @@
         .replace(/\bfastsw\.(location|top|parent|eval|Function)\b/g, "$1")
         .replace(/\bfastsw\.import\("(?:[^"\\]|\\.)*",/g, "import(")
         .replace(/\bfastsw\.meta\((import\.meta)\)/g, "$1")
+        .replace(/\bfastsw\.p\(([\w$.]+)\)/g, "$1")
         .replace(/\bfastsw\.pmo?\(fastsw\.self\)/g, "postMessage")
         .replace(/\bfastsw\.pmo?\(([\w$.]+)\)\(/g, "$1.postMessage(");
     }
@@ -194,6 +195,20 @@
           const v = node[k];
           if (Array.isArray(v)) v.forEach((c) => c && typeof c.type === "string" && fn(c, k));
           else if (v && typeof v.type === "string") fn(v, k);
+        }
+      };
+      const isNum = (n) => n.type === "Literal" && typeof n.value === "number";
+      const needsKeyGuard = (p) => {
+        switch (p.type) {
+          case "Literal": return typeof p.value !== "number" && PROP_NAMES.has(String(p.value));
+          case "UpdateExpression": return false;
+          case "UnaryExpression": return p.operator === "typeof" || p.operator === "void";
+          case "BinaryExpression":
+            if (p.operator === "+") return !(isNum(p.left) || isNum(p.right));      // number + x can never spell "location"
+            return !/^(-|\*|\/|%|\*\*|\||&|\^|<<|>>|>>>|==|!=|===|!==|<|>|<=|>=|in|instanceof)$/.test(p.operator);
+          case "MemberExpression": return !(!p.computed && p.property.name === "length");
+          case "AssignmentExpression": return p.operator === "=" || p.operator === "+=" ;
+          default: return true;
         }
       };
       const withScope = (set, fn) => { scopes.push(set); fn(); scopes.pop(); };
@@ -323,7 +338,12 @@
               if (PROP_NAMES.has(node.property.name)) edit(node.property.start, node.property.end, "fastsw$" + node.property.name);
             } else if (node.property.type === "Literal" && typeof node.property.value === "string" && PROP_NAMES.has(node.property.value))
               edit(node.property.start, node.property.end, JSON.stringify("fastsw$" + node.property.value));
-            else walk(node.property, node, "property");
+            else {
+              walk(node.property, node, "property");
+              // obfuscated code builds names at run time (window["loc"+"ation"]); route those through fastsw.p() so
+              // "location" / "top" / "parent" still hit the dummies. Provably non-string keys (numbers, arithmetic, .length) are skipped.
+              if (needsKeyGuard(node.property)) { edit(node.property.start, node.property.start, "fastsw.p("); edit(node.property.end, node.property.end, ")"); }
+            }
             return;
           case "Identifier":
             if (ID_NAMES.has(node.name) && !shadowed(node.name)) edit(node.start, node.end, "fastsw." + node.name);
@@ -336,9 +356,14 @@
       if (!edits.length) return src;
       // later edits first; at the same start a replacement goes before a zero-length insert so the insert lands in front of it
       edits.sort((a, b) => (b[0] - a[0]) || ((a[1] === a[0] ? 1 : 0) - (b[1] === b[0] ? 1 : 0)));
-      let out = src;
-      for (const [s, e, t] of edits) out = out.slice(0, s) + t + out.slice(e);
-      return out;
+      // linear-time assembly (edits are sorted last-to-first; the old repeated slice/concat was quadratic)
+      const parts = []; let last = src.length;
+      for (const [s, e, t] of edits) {
+        if (e > last) continue;                                   // overlapping edit: never emit text twice
+        parts.push(src.slice(e, last), t); last = s;
+      }
+      parts.push(src.slice(0, last));
+      return parts.reverse().join("");
     }
 
     /* ---- legacy scanner (only used when acorn is missing or the source can't be parsed) ---- */
@@ -592,15 +617,24 @@
     const afterCookies = (fn) => (acks.size ? Promise.all([...acks]).then(fn, fn) : fn());
 
     /* ---------- fake Location (fastsw.location) ---------- */
+    // Shaped like the real Location: Location.prototype (so instanceof / Object.prototype.toString say "Location"), the same own
+    // keys in the same order, no extras (valueOf / Symbol.toPrimitive are NOT own properties of a real Location)
     const L = {};
+    safe(() => { if (G.Location && G.Location.prototype) Object.setPrototypeOf(L, G.Location.prototype); });
+    Object.defineProperty(L, "ancestorOrigins", { enumerable: true, configurable: false, get() {
+      const out = [];
+      safe(() => { let w = G; while (w.parent && w.parent !== w) { w = w.parent; out.push(safe(() => (w.fastsw ? w.fastsw.location.origin : w.location.origin), "null")); } });
+      Object.defineProperty(out, "item", { value: (i) => (i in out ? out[i] : null) });
+      Object.defineProperty(out, "contains", { value: (x) => out.indexOf(x) >= 0 });
+      return out;
+    } });
     for (const p of ["href", "origin", "protocol", "host", "hostname", "port", "pathname", "search", "hash"]) {
       Object.defineProperty(L, p, {
         enumerable: true,
         get: () => lurl()[p],
-        set: (v) => {
+        set: p === "origin" ? undefined : (v) => {
           if (p === "hash") { realLoc.hash = v; return; }
           if (p === "href") { const t = R(v); afterCookies(() => { realLoc.href = t; }); return; }
-          if (p === "origin") return;
           const u = lurl(); u[p] = v; const t = core.encode(u.href); afterCookies(() => { realLoc.href = t; });
         },
       });
@@ -609,15 +643,6 @@
     L.replace = (v) => { const t = R(v); afterCookies(() => realLoc.replace(t)); };
     L.reload = () => { afterCookies(() => realLoc.reload()); };
     L.toString = () => lurl().href;
-    L.valueOf = () => lurl().href;
-    Object.defineProperty(L, "ancestorOrigins", { enumerable: true, get() {
-      const out = [];
-      safe(() => { let w = G; while (w.parent && w.parent !== w) { w = w.parent; out.push(safe(() => (w.fastsw ? w.fastsw.location.origin : w.location.origin), "null")); } });
-      Object.defineProperty(out, "item", { value: (i) => (i in out ? out[i] : null) });
-      Object.defineProperty(out, "contains", { value: (x) => out.indexOf(x) >= 0 });
-      return out;
-    } });
-    L[Symbol.toPrimitive] = () => lurl().href;
 
     /* ---------- fastsw object: dummy top / parent / location so pages can't bust out ---------- */
     const isFast = (w) => safe(() => !!w.fastsw, false);
@@ -659,6 +684,7 @@
         construct(t, a, nt) { if (a.length) a[a.length - 1] = core.rewriteJS(String(a[a.length - 1]), base()); return Reflect.construct(t, a, nt === undefined ? t : nt); },
         apply(t, th, a) { if (a.length) a[a.length - 1] = core.rewriteJS(String(a[a.length - 1]), base()); return Reflect.apply(t, th, a); },
       }),
+      p: (k) => (typeof k === "string" && (k === "location" || k === "top" || k === "parent") ? "fastsw$" + k : k),
       pm: (o) => (o == null
         ? function postMessage() { throw new TypeError("Cannot read properties of " + o + " (reading 'postMessage')"); }
         : function postMessage(...a) { return o.postMessage(...pmArgs(a)); }),
@@ -795,7 +821,7 @@
             }
           } catch (e) {}
         };
-        const targets = natTargets();
+        const targets = natTargets(); targets.push(L);
         for (const o of targets) {
           for (const k of Reflect.ownKeys(o)) {
             let d; try { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { continue; }
@@ -842,7 +868,15 @@
     const D = Document.prototype;
     getter(D, "URL", () => lurl().href);
     getter(D, "documentURI", () => lurl().href);
-    getter(D, "referrer", (v) => core.unrewrite(v));
+    getter(D, "referrer", (v) => {
+      if (typeof v !== "string") return v;
+      if (v === G.location.origin + "/") {                      // origin-only referrer (the page's policy): the proxy origin is not the real referrer
+        try { if (G.parent !== G && G.parent.fastsw) return G.parent.fastsw.location.origin + "/"; } catch (e) {}
+        try { if (G.opener && G.opener.fastsw) return G.opener.fastsw.location.origin + "/"; } catch (e) {}
+        return "";
+      }
+      return core.unrewrite(v);
+    });
     getter(D, "domain", () => cur().hostname);
     getter(Node.prototype, "baseURI", (v) => core.unrewrite(v));
 
