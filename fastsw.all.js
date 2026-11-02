@@ -1210,7 +1210,7 @@
       }
       for (const d of DBG) {
         if (f && !(d.url || "").toLowerCase().includes(f)) continue;
-        txt += `[${d.t}] ${d.method} ${d.url}\n    dest=${d.dest} mode=${d.mode} nav=${d.nav} -> ${d.status}${d.err ? "  ERROR: " + d.err : ""}\n`;
+        txt += `[${d.t}] ${d.method} ${d.url}\n    dest=${d.dest} mode=${d.mode} nav=${d.nav} -> ${d.status}${d.err ? "  ERROR: " + d.err : ""}\n    page=${d.page} request.referrer=${d.refIn} policy=${d.refPol}\n`;
         if (d.sent) txt += "    sent: " + Object.entries(d.sent).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`).join("\n          ") + "\n";
         if (d.setCookies && d.setCookies.length) txt += "    set-cookie: " + d.setCookies.join(" | ") + "\n";
         if (d.location) txt += "    location: " + d.location + "\n";
@@ -1297,7 +1297,7 @@
       out.set("access-control-allow-credentials", "true");
       safe0(() => {
         const sent = { ...h }; sent.cookie = cookieNames(h.cookie);
-        dbg({ method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent,
+        dbg({ method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent, page: page || "(none)", refIn: req.referrer, refPol: req.referrerPolicy,
           setCookies: raw.filter(([k]) => k.toLowerCase() === "set-cookie").map(([, v]) => String(v).replace(/^([^=]+)=[^;]*/, "$1=<v>")),
           location: (raw.find(([k]) => k.toLowerCase() === "location") || [])[1] });
       });
@@ -1356,10 +1356,22 @@
           if (fq && fq !== "?") { try { const t = new URL(p); t.search = fq; p = t.href; } catch (err) {} }
           return p;
         };
-        const findPage = async () => {
+        // The page (real site URL) that made this request. request.referrer is NOT reliable: Google's pages ask for the
+        // "origin" referrer policy, which leaves only "https://proxy/" there. So: the requesting client first, then the
+        // referrer, then (frame / page-initiated navigations, which have no client yet) the focused proxied window.
+        const findPage = async (loose) => {
           const client = e.clientId ? await self.clients.get(e.clientId) : null;
-          const ref = client && client.url && client.url.startsWith(ORIGIN + PREFIX) ? client.url : refStr;
-          return ref ? pageOf(ref) : null;
+          if (client && client.url && client.url.startsWith(ORIGIN + PREFIX)) return pageOf(client.url);
+          if (refStr) return pageOf(refStr);
+          if (loose && req.referrer && req.referrer.startsWith(ORIGIN)) {
+            try {
+              const all = (await self.clients.matchAll({ type: "window", includeUncontrolled: true })).filter((c) => c.url.startsWith(ORIGIN + PREFIX));
+              const fr = /^(iframe|frame|embed|object)$/.test(req.destination || "");
+              const c = all.find((x) => x.focused) || (fr ? all.find((x) => x.visibilityState === "visible") : null);
+              if (c) return pageOf(c.url);
+            } catch (err) {}
+          }
+          return null;
         };
 
         if (u.origin === ORIGIN && u.pathname.startsWith(PREFIX)) {
@@ -1370,7 +1382,7 @@
             // encoded target never has its own "?" (encodeURIComponent turns it into %3F), so just swap it in.
             const fq = stripMarker(u.search);
             if (fq && fq !== "?") { try { const tu = new URL(target); tu.search = fq; target = tu.href; } catch (err) {} }
-            if (refStr) page = pageOf(refStr);
+            page = await findPage(true);
           } else {
             // A RELATIVE url the rewriter missed (img.png, ./a/b.js, ?x=1 …) was resolved by the browser against the
             // proxy URL, so it landed *under* /fastsw/service/. Resolve it against the real page instead.
