@@ -1009,15 +1009,25 @@
     });
     if (G.Attr) setter(Attr.prototype, "value", (v, a) => (URLA.has(a.name.toLowerCase()) ? R(v) : v));
     const E = Element.prototype, sa = E.setAttribute, ga = E.getAttribute;
+    const META_STRIP = /^(content-security-policy|content-security-policy-report-only|x-content-security-policy|x-webkit-csp|x-frame-options)$/i;
     E.setAttribute = function (n, v) {
       const l = String(n).toLowerCase(); v = String(v);
       if (l === "integrity") return;
+      // CSP via <meta> can be built at runtime too (setAttribute("http-equiv", ...) + content), not just present in the
+      // initial HTML we already strip it from; block it here the same way so it can't block our own injected script
+      if (l === "http-equiv" && META_STRIP.test(v.trim())) return;
       if (URLA.has(l)) v = /^\s*javascript:/i.test(v) ? "javascript:" + core.rewriteJS(v.replace(/^\s*javascript:/i, ""), base()) : R(v);
       else if (l === "srcset" || l === "imagesrcset") v = core.rewriteSrcset(v, base());
       else if (l === "style") v = core.rewriteCSS(v, base());
       else if (/^on[a-z]+$/.test(l)) v = core.rewriteJS(v, base());
       return sa.call(this, n, v);
     };
+    // the .httpEquiv / .content IDL properties on <meta> reflect the attribute WITHOUT going through setAttribute()
+    // at the JS level, so they'd bypass the block above entirely if left unpatched
+    if (G.HTMLMetaElement) {
+      const d = Object.getOwnPropertyDescriptor(HTMLMetaElement.prototype, "httpEquiv");
+      if (d && d.set) Object.defineProperty(HTMLMetaElement.prototype, "httpEquiv", { ...d, set(v) { d.set.call(this, META_STRIP.test(String(v).trim()) ? "" : v); } });
+    }
     E.getAttribute = function (n) { const v = ga.call(this, n); return URLA.has(String(n).toLowerCase()) ? core.unrewrite(v) : v; };
 
     // dynamic HTML
