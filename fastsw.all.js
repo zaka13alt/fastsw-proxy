@@ -630,7 +630,8 @@
       const of = G.fetch;
       G.fetch = function (i, init) {
         try {
-          if (typeof Request !== "undefined" && i instanceof Request) i = new Request(R(i.url), i);
+          if (init && init.integrity) init = { ...init, integrity: "" };            // SRI can never match: we rewrite the bytes
+          if (typeof Request !== "undefined" && i instanceof Request) { i = new Request(R(i.url), i); if (i.integrity) i = new Request(i, { integrity: "" }); }
           else i = R(i && i.href !== undefined ? i.href : i);
         } catch (e) {}
         return of.call(this, i, init);
@@ -653,6 +654,7 @@
             if (worker && a[1] && a[1].type === "module" && u.startsWith(cfg.prefix)) u += (u.includes("?") ? "&" : "?") + "fastsw_module=1";
             a[0] = u;
           }
+          if (name === "Request" && a[1] && a[1].integrity) a[1] = { ...a[1], integrity: "" };
           return Reflect.construct(t, a, nt === undefined ? t : nt);
         },
       });
@@ -825,6 +827,15 @@
       return cur().origin;
     });
     for (const C of [HTMLImageElement, HTMLSourceElement]) setter(C.prototype, "srcset", (v) => core.rewriteSrcset(String(v), base()));
+    // Subresource Integrity: our rewritten scripts/styles can never match the site's hash, and sites often set it
+    // from JS (`s.integrity = "sha384-…"` — e.g. Google's recaptcha loader on the "unusual traffic" page).
+    // Swallow the value (still readable back) so the browser never enforces it.
+    for (const C of [G.HTMLScriptElement, G.HTMLLinkElement]) {
+      const d = C && Object.getOwnPropertyDescriptor(C.prototype, "integrity"); if (!d) continue;
+      const kept = new WeakMap();
+      Object.defineProperty(C.prototype, "integrity", { configurable: true, enumerable: d.enumerable,
+        get() { return kept.has(this) ? kept.get(this) : ""; }, set(v) { kept.set(this, String(v)); } });
+    }
     const URLA = new Set(["href", "src", "action", "poster", "data", "formaction", "background", "manifest"]);
     if (G.Attr) setter(Attr.prototype, "value", (v, a) => (URLA.has(a.name.toLowerCase()) ? R(v) : v));
     const E = Element.prototype, sa = E.setAttribute, ga = E.getAttribute;
