@@ -24,6 +24,11 @@
     // Acorn (the JS parser) is embedded in this file, so there's nothing else to host.
     libcurlJS: "/fastsw/libcurl_full.js",
     pageWebSocket: true,                 // inject libcurl into pages so WebSocket() goes through Wisp
+    // Paths on YOUR OWN host that the service worker must never touch (your site's css / images / extra pages).
+    // Exact path, or a prefix if it ends with "/".  e.g.  ["/assets/", "/favicon.ico", "/about.html"]
+    // (Requests from proxied pages that use these paths for the *proxied site* would also be bypassed, so only list
+    //  paths you really need.)  Your pages that aren't proxied are never touched anyway.
+    bypass: [],
   };
 
   /* ------------------------------------------------------------------ *
@@ -52,7 +57,14 @@
     const SKIP = /^(?:data:|blob:|about:|mailto:|tel:|sms:|#|javascript:)/i;
     // FastSW's own files (runtime, libcurl, acorn) live on the proxy origin and must never be proxied
     const RESERVED = new Set([cfg.clientPath, cfg.libcurlJS].filter(Boolean));
-    const isReserved = (u) => RESERVED.has(u.startsWith(ORIGIN) ? u.slice(ORIGIN.length) : u);
+    const BYPASS = Array.isArray(cfg.bypass) ? cfg.bypass : [];
+    const isReserved = (u) => {
+      const abs = u.startsWith(ORIGIN);                      // an ABSOLUTE url on the proxy's own origin
+      const p = abs ? u.slice(ORIGIN.length) : u;
+      if (RESERVED.has(p)) return true;
+      // relative urls always belong to the proxied SITE; only absolute proxy-origin urls can be "your" files
+      return abs && BYPASS.some((b) => { const q = p.split(/[?#]/)[0]; return b.endsWith("/") ? q.startsWith(b) : q === b; });
+    };
 
     const rewriteURL = (u, base) => {
       if (u == null) return u;
@@ -163,7 +175,9 @@
         .replace(/\b(location|top|parent): \1\b/g, "$1")
         .replace(/\bfastsw\.(location|top|parent|eval|Function)\b/g, "$1")
         .replace(/\bfastsw\.import\("(?:[^"\\]|\\.)*",/g, "import(")
-        .replace(/\bfastsw\.meta\((import\.meta)\)/g, "$1");
+        .replace(/\bfastsw\.meta\((import\.meta)\)/g, "$1")
+        .replace(/\bfastsw\.pmo?\(fastsw\.self\)/g, "postMessage")
+        .replace(/\bfastsw\.pmo?\(([\w$.]+)\)\(/g, "$1.postMessage(");
     }
 
     function rewriteJSAst(src, base) {
@@ -281,6 +295,28 @@
           case "MetaProperty":
             if (node.meta.name === "import") edit(node.start, node.end, "fastsw.meta(import.meta)");
             return;
+          case "CallExpression": {
+            const c = node.callee;
+            // x.postMessage(msg, origin, …) -> fastsw.pm(x)(msg, origin, …). The wrapper must run in the CALLER's realm:
+            // a wrapper installed on the receiving window makes the browser report the receiver as event.source.
+            if (c.type === "MemberExpression" && !node.optional && c.object.type !== "Super" &&
+                ((!c.computed && c.property.name === "postMessage") || (c.computed && c.property.type === "Literal" && c.property.value === "postMessage"))) {
+              let p = c.object.end;
+              while (p < c.end && (src[p] === ")" || /\s/.test(src[p]))) p++;
+              if (src[p] === "." || src[p] === "?" || src[p] === "[") {
+                walk(c.object, c, "object");
+                node.arguments.forEach((a) => walk(a, node, "arguments"));
+                edit(c.start, c.start, (c.optional || (parent && parent.type === "ChainExpression")) ? "fastsw.pmo(" : "fastsw.pm(");
+                edit(p, c.end, ")");
+                return;
+              }
+            } else if (c.type === "Identifier" && c.name === "postMessage" && !shadowed("postMessage")) {
+              node.arguments.forEach((a) => walk(a, node, "arguments"));
+              edit(c.start, c.end, "fastsw.pm(fastsw.self)");
+              return;
+            }
+            break;
+          }
           case "MemberExpression":
             walk(node.object, node, "object");
             if (!node.computed) {
@@ -298,7 +334,8 @@
 
       walk(ast, null, "");
       if (!edits.length) return src;
-      edits.sort((a, b) => b[0] - a[0]);
+      // later edits first; at the same start a replacement goes before a zero-length insert so the insert lands in front of it
+      edits.sort((a, b) => (b[0] - a[0]) || ((a[1] === a[0] ? 1 : 0) - (b[1] === b[0] ? 1 : 0)));
       let out = src;
       for (const [s, e, t] of edits) out = out.slice(0, s) + t + out.slice(e);
       return out;
@@ -558,7 +595,13 @@
     L.reload = () => { afterCookies(() => realLoc.reload()); };
     L.toString = () => lurl().href;
     L.valueOf = () => lurl().href;
-    L.ancestorOrigins = [];
+    Object.defineProperty(L, "ancestorOrigins", { enumerable: true, get() {
+      const out = [];
+      safe(() => { let w = G; while (w.parent && w.parent !== w) { w = w.parent; out.push(safe(() => (w.fastsw ? w.fastsw.location.origin : w.location.origin), "null")); } });
+      Object.defineProperty(out, "item", { value: (i) => (i in out ? out[i] : null) });
+      Object.defineProperty(out, "contains", { value: (x) => out.indexOf(x) >= 0 });
+      return out;
+    } });
     L[Symbol.toPrimitive] = () => lurl().href;
 
     /* ---------- fastsw object: dummy top / parent / location so pages can't bust out ---------- */
@@ -583,6 +626,11 @@
       G[n] = function (h, ...r) { if (typeof h === "string") h = core.rewriteJS(h, base()); return o.call(this === undefined || this === null ? G : this, h, ...r); };
     }
 
+    const pmArgs = (a) => {                                                   // (msg, targetOrigin[, transfer]) | (msg, {targetOrigin, transfer})
+      if (typeof a[1] === "string") a[1] = "*";
+      else if (a[1] && typeof a[1] === "object" && !Array.isArray(a[1]) && "targetOrigin" in a[1]) a[1] = { ...a[1], targetOrigin: "*" };
+      return a;
+    };
     const fastsw = {
       get location() { return L; },
       set location(v) { L.href = v; },            // bare `location = "..."` in page scripts must navigate, not clobber the dummy
@@ -596,6 +644,10 @@
         construct(t, a, nt) { if (a.length) a[a.length - 1] = core.rewriteJS(String(a[a.length - 1]), base()); return Reflect.construct(t, a, nt === undefined ? t : nt); },
         apply(t, th, a) { if (a.length) a[a.length - 1] = core.rewriteJS(String(a[a.length - 1]), base()); return Reflect.apply(t, th, a); },
       }),
+      pm: (o) => (o == null
+        ? function postMessage() { throw new TypeError("Cannot read properties of " + o + " (reading 'postMessage')"); }
+        : function postMessage(...a) { return o.postMessage(...pmArgs(a)); }),
+      pmo: (o) => (o == null ? function postMessage() {} : function postMessage(...a) { return o.postMessage(...pmArgs(a)); }),
       rewriteURL: R, unrewrite: core.unrewrite, core,
     };
     Object.defineProperty(G, "fastsw", { value: fastsw });
@@ -687,22 +739,10 @@
       History.prototype[m] = function (s, t, u) { return o.call(this, s, t, u == null ? u : R(u)); };
     }
     if (G.open) { const oo = G.open; G.open = function (u, ...r) { const w = oo.call(this, u ? R(u) : u, ...r); if (!u || /^about:blank$/i.test(u)) inject(w); return w; }; }
-    // postMessage masking. Every proxied site really lives on ONE origin (the proxy's), so a page that posts
-    // to e.g. "https://platform.twitter.com" would throw "target origin does not match the recipient's origin".
-    // NOTE: postMessage is an OWN property of each window instance ([Global] interface), not on
-    // Window.prototype, so it has to be wrapped on the window object itself (each frame wraps its own,
-    // which is also what runs when another frame calls  frame.postMessage(...)).
-    if (isWin && typeof G.postMessage === "function") {
-      const nativePM = G.postMessage;
-      const wrapped = function postMessage(...a) {
-        if (typeof a[1] === "string") a[1] = "*";                                              // (msg, targetOrigin[, transfer])
-        else if (a[1] && typeof a[1] === "object" && !Array.isArray(a[1]) && "targetOrigin" in a[1]) a[1] = { ...a[1], targetOrigin: "*" }; // (msg, {targetOrigin, transfer})
-        return nativePM.apply(this === undefined || this === null ? G : this, a);
-      };
-      safe(() => Object.defineProperty(wrapped, "toString", { value: () => "function postMessage() { [native code] }" }));
-      safe(() => Object.defineProperty(G, "postMessage", { value: wrapped, writable: true, configurable: true, enumerable: true }));
-      if (G.postMessage !== wrapped) safe(() => { G.postMessage = wrapped; });
-    }
+    // postMessage masking: every proxied site lives on ONE origin (the proxy's), so a page posting to
+    // "https://platform.twitter.com" would be dropped ("target origin does not match"). The JS rewriter turns
+    // x.postMessage(m, o) into fastsw.pm(x)(m, o); that helper runs in the CALLER's realm, which keeps
+    // event.source correct (a wrapper installed on the receiving window would make the receiver the source).
     // sites must not register their own service workers (would fight ours)
     // sites must not register their own service workers (they'd replace ours). Keep navigator.serviceWorker PRESENT
     // (deleting it is a detectable anomaly) but inert.
@@ -1029,6 +1069,11 @@
       try { return new TextDecoder(m ? m[1] : "utf-8").decode(buf); } catch (e) { return new TextDecoder().decode(buf); }
     }
 
+    // paths on YOUR host that FastSW must leave completely alone (see CONFIG.bypass)
+    const BYPASS = Array.isArray(CONFIG.bypass) ? CONFIG.bypass : [];
+    const isBypass = (p) => BYPASS.some((b) => (b.endsWith("/") ? p.startsWith(b) : p === b));
+    const stripMarker = (s) => s.replace(/([?&])fastsw_module=1(&|$)/, (m, a, b) => (b ? a : ""));   // our own module-worker marker
+
     let clientSrc = null;
     function clientScript() {
       if (!clientSrc) clientSrc = `(${fastswRuntime.toString()})(${FastswCore.toString()},${JSON.stringify(CONFIG)},(function(){var e={};(${ACORN_FACTORY.toString()})(e);return e})());`;
@@ -1135,25 +1180,49 @@
       const req = e.request, u = new URL(req.url);
       try {
         if (u.origin === ORIGIN && u.pathname === CONFIG.clientPath) return clientScript();
-        if (u.origin === ORIGIN && ASSET_PATHS.has(u.pathname)) return fetch(req);        // self-hosted libcurl / acorn: serve as-is, never proxy
+        if (u.origin === ORIGIN && ASSET_PATHS.has(u.pathname)) return fetch(req);        // self-hosted libcurl: serve as-is, never proxy
+        // YOUR host's own files (CONFIG.bypass): never proxied, never resolved against a proxied page
+        if (u.origin === ORIGIN && isBypass(u.pathname)) return fetch(req);
 
         let target, page = null;
         const refStr = req.referrer && req.referrer.startsWith(ORIGIN + PREFIX) ? req.referrer : null;
+        // the real site URL of the proxied page (document or worker) that made this request
+        const pageOf = (proxied) => {
+          const x = new URL(proxied);
+          let p = core.decode(x.pathname);
+          const fq = stripMarker(x.search);
+          if (fq && fq !== "?") { try { const t = new URL(p); t.search = fq; p = t.href; } catch (err) {} }
+          return p;
+        };
+        const findPage = async () => {
+          const client = e.clientId ? await self.clients.get(e.clientId) : null;
+          const ref = client && client.url && client.url.startsWith(ORIGIN + PREFIX) ? client.url : refStr;
+          return ref ? pageOf(ref) : null;
+        };
 
         if (u.origin === ORIGIN && u.pathname.startsWith(PREFIX)) {
           target = core.decode(u.pathname);
-          // A GET <form> submit (e.g. Google's search box) replaces the query of its action URL, so the
-          // browser sends  /fastsw/service/<enc(action)>?q=foo . The real query lives in u.search; the
-          // encoded target never has its own "?" (encodeURIComponent turns it into %3F), so just swap it in.
-          const fq = u.search.replace(/([?&])fastsw_module=1(&|$)/, (m, a, b) => (b ? a : ""));          // strip our module-worker marker
-          if (fq && fq !== "?") { try { const tu = new URL(target); tu.search = fq; target = tu.href; } catch (err) {} }
-          if (refStr) page = core.decode(new URL(refStr).pathname);
+          if (/^https?:\/\//i.test(target)) {
+            // A GET <form> submit (e.g. Google's search box) replaces the query of its action URL, so the
+            // browser sends  /fastsw/service/<enc(action)>?q=foo . The real query lives in u.search; the
+            // encoded target never has its own "?" (encodeURIComponent turns it into %3F), so just swap it in.
+            const fq = stripMarker(u.search);
+            if (fq && fq !== "?") { try { const tu = new URL(target); tu.search = fq; target = tu.href; } catch (err) {} }
+            if (refStr) page = pageOf(refStr);
+          } else {
+            // A RELATIVE url the rewriter missed (img.png, ./a/b.js, ?x=1 …) was resolved by the browser against the
+            // proxy URL, so it landed *under* /fastsw/service/. Resolve it against the real page instead.
+            page = await findPage();
+            if (!page) return new Response("FastSW: cannot resolve relative URL " + target, { status: 400 });
+            target = new URL(target + u.search, page).href;
+          }
+        } else if (u.origin === ORIGIN && u.pathname.startsWith("/fastsw/") && (page = await findPage())) {
+          // `../x` from a proxied page resolves to /fastsw/x (one level above /fastsw/service/): undo that
+          target = new URL("../" + u.pathname.slice("/fastsw/".length) + u.search, page).href;
         } else {
           // request escaped the rewriter: resolve it against whichever proxied page made it
-          const client = e.clientId ? await self.clients.get(e.clientId) : null;
-          const ref = client && client.url && client.url.startsWith(ORIGIN + PREFIX) ? client.url : refStr;
-          if (!ref) return fetch(req);                           // not a proxied client (e.g. index.html itself)
-          page = core.decode(new URL(ref).pathname);
+          page = page || (await findPage());
+          if (!page) return fetch(req);                          // not a proxied client (e.g. index.html itself)
           target = u.origin === ORIGIN ? new URL(u.pathname + u.search, page).href : req.url;
         }
         if (!/^https?:/i.test(target)) return new Response("Bad target: " + target, { status: 400 });
