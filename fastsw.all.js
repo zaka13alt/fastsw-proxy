@@ -787,29 +787,48 @@
         fire(self, st, "close", { code, reason: reason || "", wasClean: !!clean });
         try { st.inner && st.inner.close(); } catch (e) {}
       };
-      const start = (self, st) => {
+      // libcurl.js bug: CurlWebSocket.cleanup() returns immediately while !connected, so a handshake that FAILS (refused,
+      // reset, non-101, Wisp stream error) never raises error/close and the page waits forever (Discord's gateway then
+      // times out after ~22s). Intercept that path on the instance, surface it, and retry the transient codes once or twice.
+      const TRANSIENT_WS = new Set([7, 28, 52, 55, 56]);
+      const start = (self, st, attempt = 0) => {
         if (st.done) return;
         let inner;
+        const retryOrFail = (code) => {
+          if (dbgOn()) safe(() => console.log(`[fastsw] websocket connect failed (curl code ${code}, attempt ${attempt + 1}): ${st.url}`));
+          if (!st.done && !st.closeReq && attempt < 2 && TRANSIENT_WS.has(code)) { try { inner.close(); } catch (e) {} setTimeout(() => start(self, st, attempt + 1), 150 * (attempt + 1)); }
+          else fin(self, st, 1006, "", false);
+        };
         try {
           const hdr = { Origin: cur().origin }; const ua = safe(() => G.navigator.userAgent); if (ua) hdr["User-Agent"] = ua;
           inner = new LC.WebSocket(st.url, st.protocols.length ? st.protocols : null, { headers: hdr });
-        } catch (e) { fin(self, st, 1006, "", false); return; }
+        } catch (e) { retryOrFail(-1); return; }
         try { inner.binaryType = "arraybuffer"; } catch (e) {}
         st.inner = inner;
+        const sock = inner.socket;
+        if (sock && typeof sock.cleanup === "function") {
+          const oc = sock.cleanup.bind(sock);
+          sock.cleanup = (err = 0) => {
+            if (!sock.connected) { if (err && st.inner === inner) { st.inner = null; retryOrFail(err); } return; }
+            return oc(err);
+          };
+        }
         inner.addEventListener("open", () => {
-          if (st.done) return;
+          if (st.done || st.inner !== inner) return;
           st.opened = true;
+          if (dbgOn()) safe(() => console.log("[fastsw] websocket open: " + st.url));
           if (st.closeReq) { try { inner.close(); } catch (e) {} return; }
           st.rs = 1; fire(self, st, "open");
         });
         inner.addEventListener("message", (e) => {
-          if (st.done || st.rs > 2) return;
+          if (st.done || st.rs > 2 || st.inner !== inner) return;
           let d = e.data;
           if (typeof d !== "string") d = st.bt === "blob" ? new Blob([d]) : d;
           fire(self, st, "message", { data: d });
         });
-        inner.addEventListener("error", () => fin(self, st, 1006, "", false));
+        inner.addEventListener("error", () => { if (st.inner === inner) fin(self, st, 1006, "", false); });
         inner.addEventListener("close", () => {
+          if (st.inner !== inner) return;
           if (st.closeReq && st.opened) fin(self, st, st.closeReq.code, st.closeReq.reason, true);
           else fin(self, st, 1006, "", false);
         });
