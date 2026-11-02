@@ -2,7 +2,7 @@
  * fastsw.all.js — FastSW: service-worker web proxy (libcurl.js + Wisp transport)
  *
  * One file, three roles:
- *   1. Loaded with <script> in a page     -> exposes window.Fastsw (register / encode / go)
+ *   1. Loaded with <script> in a page     -> exposes window.Fastsw (register / encode / go / createFrame)
  *   2. Registered as a service worker     -> fetches via libcurl.js over Wisp, strips headers,
  *                                            rewrites HTML / JS / CSS, keeps a cookie jar
  *   3. Served to proxied pages as /fastsw/client.js -> the in-page runtime that defines
@@ -1747,24 +1747,103 @@
     const SELF_SRC = (document.currentScript && document.currentScript.src) || "/fastsw.all.js";
     const encode = (u) => { const i = u.indexOf("#"); return CONFIG.prefix + encodeURIComponent(i < 0 ? u : u.slice(0, i)) + (i < 0 ? "" : u.slice(i)); };
 
+    /** address-bar text -> absolute URL (or a search URL) */
+    const toURL = (input, search) => {
+      input = String(input || "").trim();
+      if (!input) return "";
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) return input;
+      if (/^[^\s/]+\.[a-z]{2,}(?::\d+)?(\/\S*)?$/i.test(input) || /^localhost(:\d+)?(\/\S*)?$/i.test(input)) return "https://" + input;
+      return search.replace("%s", encodeURIComponent(input));
+    };
+    const DEFAULT_SEARCH = "https://duckduckgo.com/?q=%s";
+    const register = async () => {
+      if (!("serviceWorker" in navigator)) throw new Error("Service workers are not supported (need https:// or localhost).");
+      await navigator.serviceWorker.register(SELF_SRC, { scope: "/", updateViaCache: "none" });
+      await navigator.serviceWorker.ready;
+    };
+
+    /**
+     * A proxied page inside an <iframe> you control.
+     *   const f = Fastsw.createFrame("https://example.com", { container: document.body });
+     *   f.go("wikipedia.org"); f.back(); f.forward(); f.reload(); f.url; f.title; f.destroy();
+     *   f.addEventListener("navigate", (e) => e.detail.url);    // every load
+     *   f.addEventListener("urlchange", (e) => e.detail.url);   // also pushState / hash changes
+     * First argument may be a URL/search string, an existing <iframe>, or an options object
+     * { url, frame, container, search, attrs, className, style }.
+     */
+    class Frame extends EventTarget {
+      constructor(arg, opts) {
+        super();
+        if (arg && typeof arg === "object" && !(arg instanceof HTMLIFrameElement)) opts = arg;
+        else opts = Object.assign({}, opts, arg instanceof HTMLIFrameElement ? { frame: arg } : { url: arg });
+        opts = opts || {};
+        this.search = opts.search || DEFAULT_SEARCH;
+        const own = !opts.frame;
+        const el = this.element = opts.frame || document.createElement("iframe");
+        this._own = own;
+        if (own) {
+          el.setAttribute("allow", "fullscreen; autoplay; clipboard-read; clipboard-write; encrypted-media; picture-in-picture; web-share; payment; geolocation; microphone; camera");
+          el.setAttribute("allowfullscreen", "");
+          el.style.cssText = "border:0;width:100%;height:100%;";
+        }
+        if (opts.className) el.className = opts.className;
+        if (opts.style) el.style.cssText += ";" + opts.style;
+        if (opts.attrs) for (const k of Object.keys(opts.attrs)) el.setAttribute(k, opts.attrs[k]);
+        if (opts.container && !el.isConnected) opts.container.appendChild(el);
+        this._last = "";
+        this._onload = () => { this._tick(true); };
+        el.addEventListener("load", this._onload);
+        this._timer = setInterval(() => this._tick(false), 250);
+        this.ready = register();
+        this.ready.catch(() => {});
+        if (opts.url) this.go(opts.url);
+      }
+      _tick(load) {
+        if (!this.element.isConnected) return;
+        const u = this.url;
+        if (load) this.dispatchEvent(new CustomEvent("navigate", { detail: { url: u } }));
+        if (u !== this._last) { this._last = u; this.dispatchEvent(new CustomEvent("urlchange", { detail: { url: u } })); }
+      }
+      /** navigate to a URL, domain or search text */
+      go(input) {
+        const url = toURL(input, this.search);
+        if (!url) return this.ready;
+        return this.ready.then(() => { this.element.src = encode(url); });
+      }
+      /** the REAL address of the page currently shown (not the /fastsw/service/... one) */
+      get url() {
+        let w; try { w = this.element.contentWindow; if (!w) return ""; } catch (e) { return ""; }
+        try { if (w.fastsw && w.fastsw.location) return w.fastsw.location.href; } catch (e) {}
+        try {
+          const l = w.location;
+          if (l.pathname.startsWith(CONFIG.prefix)) return decodeURIComponent(l.pathname.slice(CONFIG.prefix.length)) + l.hash;
+          return l.href;
+        } catch (e) { return ""; }
+      }
+      get title() { try { return this.element.contentDocument.title; } catch (e) { return ""; } }
+      back() { try { this.element.contentWindow.history.back(); } catch (e) {} }
+      forward() { try { this.element.contentWindow.history.forward(); } catch (e) {} }
+      reload() { try { this.element.contentWindow.location.reload(); } catch (e) { this.element.src = this.element.src; } }
+      destroy() {
+        clearInterval(this._timer);
+        this.element.removeEventListener("load", this._onload);
+        if (this._own) this.element.remove();
+      }
+    }
+
     window.Fastsw = {
       CONFIG,
       encode,
       core: FastswCore,
       makeAcorn,
-      async register() {
-        if (!("serviceWorker" in navigator)) throw new Error("Service workers are not supported (need https:// or localhost).");
-        await navigator.serviceWorker.register(SELF_SRC, { scope: "/", updateViaCache: "none" });
-        await navigator.serviceWorker.ready;
-      },
+      Frame,
+      register,
+      /** create a proxied <iframe> — see Frame above */
+      createFrame(arg, opts) { return new Frame(arg, opts); },
       /** Turn address-bar text into a URL (or a search) and navigate to the proxied version. */
-      go(input, { search = "https://duckduckgo.com/?q=%s", target } = {}) {
-        input = String(input || "").trim();
-        if (!input) return;
-        let url;
-        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(input)) url = input;
-        else if (/^[^\s/]+\.[a-z]{2,}(?::\d+)?(\/\S*)?$/i.test(input) || /^localhost(:\d+)?(\/\S*)?$/i.test(input)) url = "https://" + input;
-        else url = search.replace("%s", encodeURIComponent(input));
+      go(input, { search = DEFAULT_SEARCH, target } = {}) {
+        const url = toURL(input, search);
+        if (!url) return;
         const dest = encode(url);
         if (target) target.location.href = dest; else window.location.href = dest;
       },
