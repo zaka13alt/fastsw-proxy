@@ -342,7 +342,11 @@
               walk(node.property, node, "property");
               // obfuscated code builds names at run time (window["loc"+"ation"]); route those through fastsw.p() so
               // "location" / "top" / "parent" still hit the dummies. Provably non-string keys (numbers, arithmetic, .length) are skipped.
-              if (needsKeyGuard(node.property)) { edit(node.property.start, node.property.start, "fastsw.p("); edit(node.property.end, node.property.end, ")"); }
+              if (needsKeyGuard(node.property)) {
+                // a comma expression must stay ONE argument: H[a,b] -> H[fastsw.p((a,b))], never fastsw.p(a,b)
+                const seq = node.property.type === "SequenceExpression";
+                edit(node.property.start, node.property.start, seq ? "fastsw.p((" : "fastsw.p("); edit(node.property.end, node.property.end, seq ? "))" : ")");
+              }
             }
             return;
           case "Identifier":
@@ -783,6 +787,7 @@
       };
       const fin = (self, st, code, reason, clean) => {
         if (st.done) return; st.done = true; st.rs = 3; clearTimeout(st.timer);
+        safe(() => console.log(`[fastsw] websocket closed code=${code} opened=${st.opened} after ${Date.now() - st.t0}ms: ${st.url}`));
         if (!st.opened) fire(self, st, "error");
         fire(self, st, "close", { code, reason: reason || "", wasClean: !!clean });
         try { st.inner && st.inner.close(); } catch (e) {}
@@ -795,7 +800,7 @@
         if (st.done) return;
         let inner;
         const retryOrFail = (code) => {
-          if (dbgOn()) safe(() => console.log(`[fastsw] websocket connect failed (curl code ${code}, attempt ${attempt + 1}): ${st.url}`));
+          safe(() => console.warn(`[fastsw] websocket connect failed (curl code ${code}, attempt ${attempt + 1}, ${Date.now() - st.t0}ms): ${st.url}`));
           if (!st.done && !st.closeReq && attempt < 2 && TRANSIENT_WS.has(code)) { try { inner.close(); } catch (e) {} setTimeout(() => start(self, st, attempt + 1), 150 * (attempt + 1)); }
           else fin(self, st, 1006, "", false);
         };
@@ -816,7 +821,7 @@
         inner.addEventListener("open", () => {
           if (st.done || st.inner !== inner) return;
           st.opened = true;
-          if (dbgOn()) safe(() => console.log("[fastsw] websocket open: " + st.url));
+          safe(() => console.log(`[fastsw] websocket open after ${Date.now() - st.t0}ms: ${st.url}`));
           if (st.closeReq) { try { inner.close(); } catch (e) {} return; }
           st.rs = 1; fire(self, st, "open");
         });
@@ -842,7 +847,7 @@
         let pr = args[1] === undefined ? [] : typeof args[1] === "string" ? [args[1]] : Array.from(args[1], String);
         if (new Set(pr).size !== pr.length) throw new DOMException("Failed to construct 'WebSocket': The subprotocol '" + pr.find((x, i) => pr.indexOf(x) !== i) + "' is duplicated.", "SyntaxError");
         const self = Reflect.construct(EventTarget, [], nt || NativeWS);
-        const st = { url: u.href, protocols: pr, rs: 0, bt: "blob", on: {}, inner: null, closeReq: null, done: false, opened: false, pend: 0, q: Promise.resolve(), timer: 0 };
+        const st = { url: u.href, protocols: pr, rs: 0, bt: "blob", on: {}, inner: null, closeReq: null, done: false, opened: false, pend: 0, q: Promise.resolve(), timer: 0, t0: Date.now() };
         WS.set(self, st);
         if (wsReady) start(self, st); else wsWait.push(() => start(self, st));
         return self;
