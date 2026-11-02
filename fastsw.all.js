@@ -649,7 +649,9 @@
       const O = G[name]; if (!O) return;
       G[name] = new Proxy(O, {
         construct(t, a, nt) {
-          if ((a[0] != null && typeof a[0] !== "object") || a[0] instanceof URL) {
+          // URL may be a string, a URL object, or a TrustedScriptURL (reCAPTCHA creates its worker from one,
+          // so skipping "objects" left the real google.com URL in place and the browser refused it: cross-origin Worker)
+          if ((a[0] != null && typeof a[0] !== "object") || a[0] instanceof URL || (G.TrustedScriptURL && a[0] instanceof G.TrustedScriptURL)) {
             let u = R(String(a[0]));
             if (worker && a[1] && a[1].type === "module" && u.startsWith(cfg.prefix)) u += (u.includes("?") ? "&" : "?") + "fastsw_module=1";
             a[0] = u;
