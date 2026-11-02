@@ -1195,6 +1195,30 @@
       }
     }
 
+    /* ---------------- diagnostics: open /fastsw/debug in the proxy origin ---------------- */
+    const safe0 = (f) => { try { f(); } catch (e) {} };
+    const DBG = [];
+    const dbg = (o) => { o.t = new Date().toISOString().slice(11, 23); DBG.push(o); if (DBG.length > 500) DBG.shift(); };
+    const cookieNames = (c) => (c ? c.split("; ").map((x) => x.split("=")[0]).join(",") : "(none)");
+    function debugPage(u) {
+      const f = (u.searchParams.get("f") || "").toLowerCase();
+      let txt = `FastSW debug — last ${DBG.length} proxied requests (cookie VALUES are never shown)\n` +
+        `UA: ${self.navigator.userAgent}\nfilter: ?f=<text> (e.g. ?f=accounts.google) | ?cookies=1 lists the cookie jar\n\n`;
+      if (u.searchParams.has("cookies")) {
+        for (const c of jar.map.values()) txt += `${c.domain}${c.hostOnly ? " (host-only)" : ""} ${c.path} ${c.name}${c.secure ? " Secure" : ""}${c.httpOnly ? " HttpOnly" : ""} len=${c.value.length}\n`;
+        return new Response(txt, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+      }
+      for (const d of DBG) {
+        if (f && !(d.url || "").toLowerCase().includes(f)) continue;
+        txt += `[${d.t}] ${d.method} ${d.url}\n    dest=${d.dest} mode=${d.mode} nav=${d.nav} -> ${d.status}${d.err ? "  ERROR: " + d.err : ""}\n`;
+        if (d.sent) txt += "    sent: " + Object.entries(d.sent).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`).join("\n          ") + "\n";
+        if (d.setCookies && d.setCookies.length) txt += "    set-cookie: " + d.setCookies.join(" | ") + "\n";
+        if (d.location) txt += "    location: " + d.location + "\n";
+        txt += "\n";
+      }
+      return new Response(txt, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+    }
+
     /* ---------------- the proxy request ---------------- */
     async function proxy(req, target, page) {
       await ensureReady();
@@ -1271,6 +1295,12 @@
       if (!sawCookie && r.headers && typeof r.headers.getSetCookie === "function") r.headers.getSetCookie().forEach((c) => jar.set(t.href, c));
       out.set("access-control-allow-origin", ORIGIN);
       out.set("access-control-allow-credentials", "true");
+      safe0(() => {
+        const sent = { ...h }; sent.cookie = cookieNames(h.cookie);
+        dbg({ method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent,
+          setCookies: raw.filter(([k]) => k.toLowerCase() === "set-cookie").map(([, v]) => String(v).replace(/^([^=]+)=[^;]*/, "$1=<v>")),
+          location: (raw.find(([k]) => k.toLowerCase() === "location") || [])[1] });
+      });
 
       if (r.status >= 300 && r.status < 400 && out.has("location")) return new Response(null, { status: r.status, headers: out });
 
@@ -1311,6 +1341,7 @@
       const req = e.request, u = new URL(req.url);
       try {
         if (u.origin === ORIGIN && u.pathname === CONFIG.clientPath) return clientScript();
+        if (u.origin === ORIGIN && u.pathname === "/fastsw/debug") return debugPage(u);
         if (u.origin === ORIGIN && ASSET_PATHS.has(u.pathname)) return fetch(req);        // self-hosted libcurl: serve as-is, never proxy
         // YOUR host's own files (CONFIG.bypass): never proxied, never resolved against a proxied page
         if (u.origin === ORIGIN && isBypass(u.pathname)) return fetch(req);
@@ -1359,6 +1390,7 @@
         if (!/^https?:/i.test(target)) return new Response("Bad target: " + target, { status: 400 });
         return await proxy(req, target, page);
       } catch (err) {
+        safe0(() => dbg({ method: req.method, url: req.url, dest: req.destination || "", mode: req.mode, nav: req.mode === "navigate", status: 502, err: String((err && err.message) || err) }));
         return new Response(
           `<!doctype html><meta charset=utf-8><title>FastSW error</title><body style="font:15px system-ui;padding:2rem;background:#0b0d12;color:#e6e8ee"><h2>FastSW couldn't load this page</h2><pre style="white-space:pre-wrap">${esc(err && err.stack || err)}</pre>`,
           { status: 502, headers: { "content-type": "text/html; charset=utf-8" } });
