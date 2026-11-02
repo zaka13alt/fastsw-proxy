@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>FastSW</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    form { display: flex; gap: 4px; padding: 4px; }
+    #url { flex: 1; }
+    #view { height: calc(100vh - 40px); }
+  </style>
+</head>
+<body>
+  <form id="form">
+    <button type="button" id="back">&larr;</button>
+    <button type="button" id="forward">&rarr;</button>
+    <button type="button" id="reload">&#8635;</button>
+    <input id="url" placeholder="Search or enter a URL" autofocus>
+    <button>Go</button>
+  </form>
+  <div id="view"></div>
+
+  <script src="/fastsw.min.js"></script>
+  <script>
+    const url = document.getElementById("url");
+    const frame = Fastsw.createFrame({ container: document.getElementById("view") });
+
+    document.getElementById("form").onsubmit = (e) => { e.preventDefault(); frame.go(url.value); };
+    document.getElementById("back").onclick = () => frame.back();
+    document.getElementById("forward").onclick = () => frame.forward();
+    document.getElementById("reload").onclick = () => frame.reload();
+
+    // keep the box in sync with the page's real URL
+    frame.addEventListener("urlchange", (e) => { if (document.activeElement !== url) url.value = e.detail.url; });
+  </script>
+</body>
+</html>
