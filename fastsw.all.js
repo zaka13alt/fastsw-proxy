@@ -477,6 +477,7 @@
     }
 
     function rewriteHTML(html, base, inject, boot) {
+      const pageBase = base;
       const bm = /<base\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(html);
       if (bm) { try { base = new URL(unent(bm[1] !== undefined ? bm[1] : bm[2] !== undefined ? bm[2] : bm[3]), base).href; } catch (e) {} }
 
@@ -496,7 +497,7 @@
           return `<${sTag}${a}>${body}</${sTag}>`;
         }
         const t = tag.toLowerCase();
-        if (t === "base") return "";
+        if (t === "base") return `<${tag}${rewriteAttrs(t, attrs, pageBase)}>`;       // kept: scripts read it (Google sign-in builds its base URL from it)
         if (t === "meta") {
           if (/http-equiv\s*=\s*["']?\s*(content-security-policy|x-frame-options)/i.test(attrs)) return "";
           if (/http-equiv\s*=\s*["']?\s*refresh/i.test(attrs))
@@ -1208,6 +1209,21 @@
       const f = (u.searchParams.get("f") || "").toLowerCase();
       let txt = `FastSW debug — last ${DBG.length} proxied requests (cookie VALUES are never shown)\n` +
         `UA: ${self.navigator.userAgent}\nfilter: ?f=<text> (e.g. ?f=accounts.google) | ?cookies=1 lists the cookie jar\n\n`;
+      if (u.searchParams.has("find")) {
+        const needle = u.searchParams.get("find"), ctx = Math.min(1500, +u.searchParams.get("ctx") || 400);
+        return (async () => {
+          let out = `search for ${JSON.stringify(needle)} in the ${srcCache.size} script(s) fetched for recent error traces (rewritten source)\n\n`;
+          for (const [url, p] of srcCache) {
+            let sc; try { sc = await p; } catch (e) { continue; }
+            out += `== ...${url.slice(-70)} (${sc.rw.length} chars)\n`;
+            let i = -1, n = 0;
+            while (n < 4 && (i = sc.rw.indexOf(needle, i + 1)) >= 0) { out += `--- @${i}\n${sc.rw.slice(Math.max(0, i - ctx / 4), i + ctx)}\n`; n++; }
+            if (!n) out += "(not found)\n";
+            out += "\n";
+          }
+          return new Response(out, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+        })();
+      }
       if (u.searchParams.has("cookies")) {
         for (const c of jar.map.values()) txt += `${c.domain}${c.hostOnly ? " (host-only)" : ""} ${c.path} ${c.name}${c.secure ? " Secure" : ""}${c.httpOnly ? " HttpOnly" : ""} len=${c.value.length}\n`;
         return new Response(txt, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
