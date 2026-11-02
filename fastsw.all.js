@@ -903,6 +903,22 @@
     const iah = E.insertAdjacentHTML;
     E.insertAdjacentHTML = function (p, h) { return iah.call(this, p, rh(h)); };
     for (const m of ["write", "writeln"]) { const o = D[m]; D[m] = function (...a) { return o.apply(this, a.map(rh)); }; }
+    // the other ways a page can turn a string into DOM (each would otherwise leave real URLs in the markup)
+    safe(() => { const o = DOMParser.prototype.parseFromString; DOMParser.prototype.parseFromString = function (h, t) { return o.call(this, /html/i.test(t) ? rh(h) : h, t); }; });
+    safe(() => { const o = Range.prototype.createContextualFragment; Range.prototype.createContextualFragment = function (h) { return o.call(this, rh(h)); }; });
+    for (const P of [G.Element && Element.prototype, G.ShadowRoot && ShadowRoot.prototype])
+      if (P && P.setHTMLUnsafe) { const o = P.setHTMLUnsafe; P.setHTMLUnsafe = function (h, ...r) { return o.call(this, rh(h), ...r); }; }
+    if (G.Document && Document.parseHTMLUnsafe) { const o = Document.parseHTMLUnsafe; Document.parseHTMLUnsafe = function (h, ...r) { return o.call(this, rh(h), ...r); }; }
+    if (G.HTMLIFrameElement) setter(HTMLIFrameElement.prototype, "srcdoc", (v) => core.rewriteHTML(String(v), base(), true, {}));
+    for (const cn of ["HTMLInputElement", "HTMLButtonElement"]) {
+      const C = G[cn]; const d = C && Object.getOwnPropertyDescriptor(C.prototype, "formAction"); if (!d || !d.get) continue;
+      Object.defineProperty(C.prototype, "formAction", { configurable: true, enumerable: d.enumerable, get() { return core.unrewrite(d.get.call(this)); }, set(v) { d.set.call(this, R(v)); } });
+    }
+    safe(() => {
+      const o = E.setAttributeNS;
+      E.setAttributeNS = function (ns, n, v) { const l = String(n).toLowerCase().replace(/^.*:/, ""); return o.call(this, ns, n, URLA.has(l) ? R(String(v)) : v); };
+    });
+    getter(Attr.prototype, "value", (v, a) => (typeof v === "string" && URLA.has(a.name.toLowerCase()) ? core.unrewrite(v) : v));
 
     // dynamic scripts / styles
     const rjs = (el, v) => {
@@ -1081,6 +1097,71 @@
       return new Response(src, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" } });
     }
 
+    // libcurl keeps connections alive and the Wisp server drops idle ones; the next request that picks up a dead
+    // connection fails with "error code 55: Failed sending data to the peer" (-> a 502 and a page that thinks it is offline,
+    // e.g. YouTube's "Connect to the internet"). The request never left, so just retry on a fresh connection.
+    const TRANSIENT = /code (55|56|52|7|35)\b|sending data|receiving data|peer|stream|closed|reset|wisp|websocket|connection/i;
+    async function curlFetch(url, init) {
+      let err;
+      for (let i = 0; i < 4; i++) {
+        try { return await libcurl.fetch(url, init); }
+        catch (e) {
+          err = e;
+          if (!TRANSIENT.test(String((e && e.message) || e)) || (init.body && i >= 1 && !/code 55|sending data/i.test(String((e && e.message) || e)))) break;
+          await new Promise((r) => setTimeout(r, 80 * (i + 1) * (i + 1)));
+        }
+      }
+      throw err;
+    }
+
+    // Client Hints. A real Chrome only adds the high-entropy hints (arch, bitness, full version list, platform version…)
+    // to an origin that asked for them via Accept-CH / Critical-CH, and re-sends the request when Critical-CH names
+    // hints it did not include. Google sign-in does this; the service worker never sees what the browser adds, so we do it
+    // ourselves (the page response's Accept-CH is stripped, so the browser itself never sends them to the proxy origin).
+    const hintWanted = new Map();                       // origin -> Set(lowercase hint header names)
+    let highP = null;
+    const highEntropy = () => highP || (highP = (async () => {
+      try {
+        const u = self.navigator.userAgentData;
+        return u && u.getHighEntropyValues ? await u.getHighEntropyValues(["architecture", "bitness", "fullVersionList", "model", "platformVersion", "uaFullVersion", "wow64", "formFactors"]) : {};
+      } catch (e) { return {}; }
+    })());
+    const q = (s) => `"${s}"`;
+    function hintValue(name, d) {
+      const list = (a) => (a || []).map((b) => `${q(b.brand)};v=${q(b.version)}`).join(", ");
+      switch (name) {
+        case "sec-ch-ua-arch": return d.architecture != null ? q(d.architecture) : null;
+        case "sec-ch-ua-bitness": return d.bitness != null ? q(d.bitness) : null;
+        case "sec-ch-ua-model": return q(d.model || "");
+        case "sec-ch-ua-platform-version": return d.platformVersion != null ? q(d.platformVersion) : null;
+        case "sec-ch-ua-full-version-list": return d.fullVersionList ? list(d.fullVersionList) : null;
+        case "sec-ch-ua-full-version": return d.uaFullVersion ? q(d.uaFullVersion) : null;
+        case "sec-ch-ua-wow64": return d.wow64 != null ? (d.wow64 ? "?1" : "?0") : null;
+        case "sec-ch-ua-form-factors": return d.formFactors ? d.formFactors.map(q).join(", ") : null;
+        case "device-memory": case "sec-ch-device-memory": return self.navigator.deviceMemory ? String(self.navigator.deviceMemory) : null;
+        default: return null;
+      }
+    }
+    async function addHints(h, origin) {
+      const want = hintWanted.get(origin); if (!want || !want.size) return;
+      const d = await highEntropy();
+      for (const n of want) { const v = hintValue(n, d); if (v != null) h[n] = v; }
+    }
+    // returns true when a Critical-CH names a hint we had not sent yet (=> the browser would retry)
+    function learnHints(origin, raw) {
+      let again = false;
+      for (const [k, v] of raw) {
+        const lk = k.toLowerCase(); if (lk !== "accept-ch" && lk !== "critical-ch") continue;
+        let set = hintWanted.get(origin); if (!set) hintWanted.set(origin, (set = new Set()));
+        for (let n of String(v).split(",")) {
+          n = n.trim().toLowerCase(); if (!n) continue;
+          if (n === "sec-ch-ua" || n === "sec-ch-ua-mobile" || n === "sec-ch-ua-platform") continue;   // always sent
+          if (!set.has(n)) { set.add(n); if (lk === "critical-ch") again = true; }
+        }
+      }
+      return again;
+    }
+
     /* ---------------- the proxy request ---------------- */
     async function proxy(req, target, page) {
       await ensureReady();
@@ -1125,7 +1206,12 @@
       if (ck) h.cookie = ck;
       const body = req.method === "GET" || req.method === "HEAD" ? undefined : await req.arrayBuffer();
 
-      const r = await libcurl.fetch(t.href, { method: req.method, headers: h, body, redirect: "manual" });
+      await addHints(h, t.origin);
+      let r = await curlFetch(t.href, { method: req.method, headers: h, body, redirect: "manual" });
+      if (learnHints(t.origin, r.raw_headers || Array.from(r.headers.entries()))) {            // Critical-CH: resend with the hints
+        await addHints(h, t.origin);
+        try { r = await curlFetch(t.href, { method: req.method, headers: h, body, redirect: "manual" }); } catch (e) {}
+      }
 
       const out = new Headers();
       const raw = r.raw_headers || Array.from(r.headers.entries());
