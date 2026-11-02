@@ -1235,6 +1235,7 @@
         if (d.setCookies && d.setCookies.length) txt += "    set-cookie: " + d.setCookies.join(" | ") + "\n";
         if (d.location) txt += "    location: " + d.location + "\n";
         if (d.jsbody) txt += "    BODY: " + d.jsbody.slice(0, 1500) + "\n";
+        if (d.reply) txt += "    REPLY (redacted): " + d.reply + "\n";
         if (d.frames) txt += "    CODE AT THE FAILING FRAMES (rewritten source):\n" + d.frames.map((f) => "    " + f).join("\n") + "\n";
         txt += "\n";
       }
@@ -1348,12 +1349,18 @@
       if (!sawCookie && r.headers && typeof r.headers.getSetCookie === "function") r.headers.getSetCookie().forEach((c) => jar.set(t.href, c));
       out.set("access-control-allow-origin", ORIGIN);
       out.set("access-control-allow-credentials", "true");
+      let dbgEnt = null, dbgRed = null;
       safe0(() => {
         const sent = { ...h }; sent.cookie = cookieNames(h.cookie);
-        const jb = /jserror|\/log\b|\/gen_204|\/error/i.test(t.pathname) && body ? (() => { const x = decodeText(body, ""); try { return decodeURIComponent(x.replace(/\+/g, " ")).slice(0, 4000); } catch (e) { return x.slice(0, 4000); } })() : undefined;
+        // error reports are logged whole; sign-in RPC bodies / replies only as a redacted shape (long tokens -> <len N>, e-mails hidden)
+        const red = (x) => { try { x = decodeURIComponent(String(x).replace(/\+/g, " ")); } catch (e) {} return x.replace(/[^\s"',\[\]@]+@[^\s"',\[\]]+/g, "<email>").replace(/[A-Za-z0-9_\-+\/=.%:]{40,}/g, (m) => `<len ${m.length}:${m.slice(0, 10)}…>`).slice(0, 2500); };
+        dbgRed = red;
+        const jb = /jserror|\/log\b|\/gen_204|\/error/i.test(t.pathname) && body ? (() => { const x = decodeText(body, ""); try { return decodeURIComponent(x.replace(/\+/g, " ")).slice(0, 4000); } catch (e) { return x.slice(0, 4000); } })()
+          : /batchexecute|browserinfo/i.test(t.pathname) && body ? "REQUEST (redacted): " + red(decodeText(body, "")) : undefined;
         const ent = { jsbody: jb, method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent, page: page || "(none)", refIn: req.referrer, refPol: req.referrerPolicy,
           setCookies: raw.filter(([k]) => k.toLowerCase() === "set-cookie").map(([, v]) => String(v).replace(/^([^=]+)=[^;]*/, "$1=<v>")),
           location: (raw.find(([k]) => k.toLowerCase() === "location") || [])[1] };
+        dbgEnt = ent;
         dbg(ent);
         if (jb && /^trace=/.test(jb)) explainTrace(ent, jb);
       });
@@ -1369,6 +1376,11 @@
       else if (/(java|ecma)script/i.test(ct)) kind = "js";
       else if (/text\/css/i.test(ct)) kind = "css";
 
+      if (!kind && dbgEnt && dbgRed && /batchexecute|browserinfo/i.test(t.pathname) && !NULL_BODY.has(r.status)) {
+        const buf = await r.arrayBuffer();                        // small RPC reply: keep a redacted copy of its start for /fastsw/debug
+        safe0(() => { dbgEnt.reply = dbgRed(decodeText(buf, "")); });
+        return new Response(buf, { status: r.status, statusText: r.statusText, headers: out });
+      }
       if (!kind || NULL_BODY.has(r.status)) {
         return new Response(NULL_BODY.has(r.status) ? null : r.body, { status: r.status, statusText: r.statusText, headers: out });
       }
