@@ -1,0 +1,13 @@
+{
+  "name": "fastsw",
+  "version": "1.0.0",
+  "description": "very fast service worker powered web proxy",
+  "main": "dist/helper.js",
+  "type": "module",
+  "scripts": {
+    "start": "node dist/helper.js"
+  },
+  "keywords": [],
+  "author": "zaka",
+  "license": "MIT"
+}
