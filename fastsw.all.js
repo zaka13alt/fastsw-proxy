@@ -509,7 +509,8 @@
         // A GET <form> submit (Google's search box) navigates to  /fastsw/service/<enc(action)>?q=…  — the form's query
         // sits on the REAL url, outside the encoded part. The SW swaps it into the target; the page must see it too,
         // otherwise location.search is empty, Google's JS thinks there is no query and sends you back to the homepage.
-        if (realLoc.search) u.search = realLoc.search;
+        const rs = realLoc.search.replace(/([?&])fastsw_module=1(&|$)/, (m, a, b) => (b ? a : ""));   // our own module-worker marker is not part of the site URL
+        if (rs && rs !== "?") u.search = rs;
         return u;
       } catch (e) { return new URL("about:blank"); }
     };
@@ -611,7 +612,10 @@
 
     /* ---------- fastsw$location / fastsw$top / fastsw$parent — the JS rewriter turns
        `x.location` into `x.fastsw$location`; for real windows/documents these return the dummies ---------- */
-    const isWinLike = (o) => safe(() => o && o.window === o, false);
+    // a global object: a Window, or a worker's scope (workers have no `window`, only `self`) — without the second
+    // test `self.location` inside a worker returned the REAL proxy URL, so e.g. reCAPTCHA's web worker saw a foreign
+    // origin and never answered ("reCAPTCHA Timeout")
+    const isWinLike = (o) => safe(() => o && (o.window === o || o.self === o), false);
     const isDocLike = (o) => isWin && o instanceof Document;
     const fastOf = (o) => (isWinLike(o) ? safe(() => o.fastsw) : isDocLike(o) ? safe(() => o.defaultView && o.defaultView.fastsw) : undefined);
     const def = (name, get, set) => Object.defineProperty(Object.prototype, "fastsw$" + name, { get, set, configurable: true, enumerable: false });
@@ -1141,7 +1145,8 @@
           // A GET <form> submit (e.g. Google's search box) replaces the query of its action URL, so the
           // browser sends  /fastsw/service/<enc(action)>?q=foo . The real query lives in u.search; the
           // encoded target never has its own "?" (encodeURIComponent turns it into %3F), so just swap it in.
-          if (u.search) { try { const tu = new URL(target); tu.search = u.search; target = tu.href; } catch (err) {} }
+          const fq = u.search.replace(/([?&])fastsw_module=1(&|$)/, (m, a, b) => (b ? a : ""));          // strip our module-worker marker
+          if (fq && fq !== "?") { try { const tu = new URL(target); tu.search = fq; target = tu.href; } catch (err) {} }
           if (refStr) page = core.decode(new URL(refStr).pathname);
         } else {
           // request escaped the rewriter: resolve it against whichever proxied page made it
