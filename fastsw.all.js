@@ -22,7 +22,7 @@
     wisp: "wss://zakaon.top/wisp/",      // your Wisp server (null = same host, /wisp/)
     // Single-file libcurl build (WASM bundled inside) hosted on YOUR origin: put libcurl_full.js in /fastsw/.
     // Acorn (the JS parser) is embedded in this file, so there's nothing else to host.
-    libcurlJS: "/fastsw/libcurl.js",
+    libcurlJS: "/fastsw/libcurl_full.js",
     pageWebSocket: true,                 // inject libcurl into pages so WebSocket() goes through Wisp
   };
 
@@ -66,7 +66,12 @@
     };
     const unrewrite = (u) => {
       if (typeof u !== "string" || !isProxied(u)) return u;
-      try { const x = new URL(u, ORIGIN); return decode(x.pathname) + x.hash; } catch (e) { return u; }
+      try {
+        const x = new URL(u, ORIGIN);
+        let t = decode(x.pathname);
+        if (x.search) { try { const tu = new URL(t); tu.search = x.search; t = tu.href; } catch (e) {} }   // form-GET query (see runtime cur())
+        return t + x.hash;
+      } catch (e) { return u; }
     };
 
     /* ---------------------------- CSS ---------------------------- */
@@ -499,11 +504,23 @@
         try { if (G.parent !== G && G.parent.fastsw) return new URL(G.parent.fastsw.location.href); } catch (e) {}
         return new URL("about:blank");
       }
-      try { return new URL(core.decode(realLoc.pathname)); } catch (e) { return new URL("about:blank"); }
+      try {
+        const u = new URL(core.decode(realLoc.pathname));
+        // A GET <form> submit (Google's search box) navigates to  /fastsw/service/<enc(action)>?q=…  — the form's query
+        // sits on the REAL url, outside the encoded part. The SW swaps it into the target; the page must see it too,
+        // otherwise location.search is empty, Google's JS thinks there is no query and sends you back to the homepage.
+        if (realLoc.search) u.search = realLoc.search;
+        return u;
+      } catch (e) { return new URL("about:blank"); }
     };
     const base = () => cur().href;
     const R = (u) => core.rewriteURL(u, base());
     const lurl = () => { const u = cur(); u.hash = realLoc.hash; return u; };
+    // canonicalise the address bar: fold a form-submitted ?query into the encoded target so reloads, history and
+    // every URL consumer see one consistent  /fastsw/service/<enc(fullUrl)>  form
+    if (typeof document !== "undefined" && realLoc.search && realLoc.pathname.startsWith(cfg.prefix)) {
+      try { History.prototype.replaceState.call(G.history, G.history.state, "", core.encode(cur().href) + realLoc.hash); } catch (e) {}
+    }
     const boot = G.__fastswBoot || {};
     const swc = safe(() => G.navigator.serviceWorker);
     // cookie writes are acknowledged by the SW, and page-initiated navigations (location.replace / assign / href)
@@ -899,7 +916,11 @@
   const IN_SW = typeof ServiceWorkerGlobalScope !== "undefined" && self instanceof ServiceWorkerGlobalScope;
 
   if (IN_SW) {
-    importScripts(CONFIG.libcurlJS);                   // single-file build: defines `libcurl` (wasm bundled)
+    // single-file build: defines `libcurl` (wasm bundled). A failure here (file missing / wrong path / host rewriting
+    // unknown paths to index.html) must NOT make the whole worker fail to install with a vague
+    // "ServiceWorker script evaluation failed" — keep the worker alive and show the real reason on the error page.
+    let libcurlLoadError = null;
+    try { importScripts(CONFIG.libcurlJS); } catch (e) { libcurlLoadError = e; }
 
     const core = FastswCore(CONFIG, makeAcorn());
     const ORIGIN = self.location.origin;
@@ -965,6 +986,9 @@
 
     let readyP = null;
     const ensureReady = () => readyP || (readyP = (async () => {
+      if (libcurlLoadError || typeof libcurl === "undefined")
+        throw new Error(`FastSW could not load ${CONFIG.libcurlJS} (${libcurlLoadError ? libcurlLoadError.name + ": " + libcurlLoadError.message : "libcurl is undefined"}).\n` +
+          `Check that the file exists at that path on your host (open ${ORIGIN}${CONFIG.libcurlJS} directly: it should download ~2 MB of JavaScript, not an HTML page), then unregister the service worker and reload.`);
       await libcurl.load_wasm("");                      // wasm is bundled in libcurl_full.js; resolves when ready
       libcurl.set_websocket(WISP);
       await jar.loaded();
