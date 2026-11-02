@@ -589,7 +589,7 @@
       "CSSStyleDeclaration", "CSSStyleSheet", "IDBFactory", "MessageEvent", "Attr", "HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
       "HTMLImageElement", "HTMLScriptElement", "HTMLStyleElement", "HTMLIFrameElement", "HTMLFrameElement", "HTMLMediaElement",
       "HTMLSourceElement", "HTMLTrackElement", "HTMLEmbedElement", "HTMLObjectElement", "HTMLInputElement", "HTMLFormElement", "HTMLVideoElement",
-      "HTMLButtonElement", "DOMParser", "Range", "WebSocket"];
+      "HTMLButtonElement", "DOMParser", "Range", "WebSocket", "Response", "Request", "EventSource", "CSSRule", "CSSImportRule", "MutationRecord"];
     const natTargets = () => { const t = [G, Object.prototype]; for (const n of NAT_PROTOS) if (G[n] && G[n].prototype) t.push(G[n].prototype); return t; };
     const snap = new Map();                      // original function.length of every native we may patch, taken BEFORE patching
     safe(() => { for (const o of natTargets()) {
@@ -1182,6 +1182,19 @@
       S.insertRule = function (r, i) { return ir.call(this, core.rewriteCSS(r, base()), i); };
       for (const m of ["replace", "replaceSync"]) { const o = S[m]; if (o) S[m] = function (c) { return o.call(this, core.rewriteCSS(c, base())); }; }
     }
+
+    // READ side of the URL surfaces: values the page reads back must show the real site URL, never /fastsw/service/<enc>.
+    const unCSS = (s) => (typeof s === "string" && s.indexOf("/fastsw/") >= 0 ? s.replace(/url\(\s*(["']?)([^)"']*?)\1\s*\)/gi, (m, q, u) => `url(${q}${core.unrewrite(u)}${q})`).replace(/@import\s+(["'])([^"']+)\1/gi, (m, q, u) => `@import ${q}${core.unrewrite(u)}${q}`) : s);
+    for (const p of ["cssText", "backgroundImage", "background", "maskImage", "listStyleImage", "content", "cursor", "borderImage"]) getter(CS, p, (v) => unCSS(v));
+    { const gp = CS.getPropertyValue; CS.getPropertyValue = function getPropertyValue(n) { return unCSS(gp.call(this, n)); }; }
+    if (G.CSSRule) getter(CSSRule.prototype, "cssText", (v) => unCSS(v));
+    if (G.CSSStyleSheet) getter(CSSStyleSheet.prototype, "href", (v) => core.unrewrite(v));
+    if (G.CSSImportRule) getter(CSSImportRule.prototype, "href", (v) => core.unrewrite(v));
+    if (G.Response) getter(Response.prototype, "url", (v) => core.unrewrite(v));
+    if (G.Request) getter(Request.prototype, "url", (v) => core.unrewrite(v));
+    if (G.EventSource) getter(EventSource.prototype, "url", (v) => core.unrewrite(v));
+    getter(XMLHttpRequest.prototype, "responseURL", (v) => core.unrewrite(v));
+    if (G.MutationRecord) getter(MutationRecord.prototype, "oldValue", (v) => (typeof v === "string" && v.indexOf("/fastsw/service/") >= 0 ? core.unrewrite(v) : v));
 
     // per-site storage isolation (every proxied site shares one real origin)
     const mkStore = (real) => {
