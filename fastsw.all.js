@@ -777,7 +777,18 @@
 
     if (G.history) for (const m of ["pushState", "replaceState"]) {
       const o = History.prototype[m];
-      History.prototype[m] = function (s, t, u) { return o.call(this, s, t, u == null ? u : R(u)); };
+      History.prototype[m] = function (s, t, u) {
+        if (u != null) {
+          // real browsers throw when the target URL's origin differs from the document's; since every proxied site
+          // shares ONE real browser origin, that native check never fires here, so a script could otherwise push the
+          // address bar to an entirely different real site while old content stays on screen. Enforce it ourselves,
+          // against the proxied site's real origin (never the proxy's own), with the same error shape a page expects.
+          let same = true; try { same = new URL(String(u), base()).origin === cur().origin; } catch (e) {}
+          if (!same) throw new DOMException(`Failed to execute '${m}' on 'History': A history state object with URL '${String(u)}' cannot be created in a document with origin '${cur().origin}' and URL '${base()}'.`, "SecurityError");
+          u = R(u);
+        }
+        return o.call(this, s, t, u);
+      };
     }
     if (G.open) { const oo = G.open; G.open = function (u, ...r) { const w = oo.call(this, u ? R(u) : u, ...r); if (!u || /^about:blank$/i.test(u)) inject(w); return w; }; }
     // postMessage masking: every proxied site lives on ONE origin (the proxy's), so a page posting to
@@ -800,6 +811,31 @@
       const io = IDBFactory.prototype.open, id = IDBFactory.prototype.deleteDatabase;
       IDBFactory.prototype.open = function (n, ...a) { return io.call(this, pfx() + n, ...a); };
       IDBFactory.prototype.deleteDatabase = function (n, ...a) { return id.call(this, pfx() + n, ...a); };
+      safe(() => {
+        if (!G.IDBDatabase) return;
+        const d = Object.getOwnPropertyDescriptor(IDBDatabase.prototype, "name"); if (!d || !d.get) return;
+        Object.defineProperty(IDBDatabase.prototype, "name", { configurable: true, enumerable: d.enumerable,
+          get() { const v = d.get.call(this); return typeof v === "string" && v.indexOf("|") >= 0 ? v.slice(v.indexOf("|") + 1) : v; } });
+      });
+    }
+    // protocol handlers can never work through a proxy (no real custom-scheme registration); no-op instead of throwing
+    safe(() => {
+      if (G.navigator && "registerProtocolHandler" in Navigator.prototype) {
+        Navigator.prototype.registerProtocolHandler = function registerProtocolHandler() {};
+        Navigator.prototype.unregisterProtocolHandler = function unregisterProtocolHandler() {};
+      }
+    });
+    // BroadcastChannel: every proxied site shares the one real origin, so two different sites using the same
+    // channel name (e.g. both "auth") would otherwise cross-talk. Scope the real channel name per proxied site,
+    // same pattern as localStorage/sessionStorage/indexedDB above.
+    if (G.BroadcastChannel) {
+      const Real = G.BroadcastChannel;
+      G.BroadcastChannel = function BroadcastChannel(name) {
+        const bc = new Real(cur().origin + "|" + name);
+        safe(() => Object.defineProperty(bc, "name", { value: String(name), enumerable: true, configurable: true }));
+        return bc;
+      };
+      safe(() => { G.BroadcastChannel.prototype = Real.prototype; });
     }
 
     /* ---------- anti-detection: make every patched function look native ----------
@@ -899,9 +935,10 @@
       },
     });
 
-    // <a>.hostname etc. should describe the real target, not the proxy
-    for (const p of ["protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin"])
-      getter(HTMLAnchorElement.prototype, p, (v, el) => safe(() => new URL(core.unrewrite(el.href))[p], v));
+    // <a>/<area>.hostname etc. should describe the real target, not the proxy (image maps use <area>, same as <a>)
+    for (const C of [HTMLAnchorElement, G.HTMLAreaElement])
+      if (C) for (const p of ["protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin"])
+        getter(C.prototype, p, (v, el) => safe(() => new URL(core.unrewrite(el.href))[p], v));
 
     // URL-bearing properties
     const UP = [["HTMLAnchorElement", "href"], ["HTMLAreaElement", "href"], ["HTMLLinkElement", "href"], ["HTMLImageElement", "src"],
@@ -913,6 +950,24 @@
       const d = Object.getOwnPropertyDescriptor(C.prototype, prop); if (!d || !d.get) continue;
       Object.defineProperty(C.prototype, prop, { configurable: true, enumerable: d.enumerable,
         get() { return core.unrewrite(d.get.call(this)); }, set(v) { d.set.call(this, R(v)); } });
+    }
+
+    // the browser's resolved pick from srcset/src: a derived, read-only URL that otherwise shows the proxied form
+    if (G.HTMLImageElement) getter(HTMLImageElement.prototype, "currentSrc", (v) => core.unrewrite(v));
+
+    // SVG <use>/<image>/<script>/<a> .href returns an SVGAnimatedString, not a plain string (<a>.href above only covers
+    // the HTML case). This is scoped to each element's .href accessor specifically, NOT SVGAnimatedString.prototype as a
+    // whole, because className on SVG elements (el.className.baseVal) is ALSO an SVGAnimatedString and isn't a URL —
+    // patching the shared prototype would wrongly run class names through the URL rewriter.
+    for (const cn of ["SVGAElement", "SVGUseElement", "SVGImageElement", "SVGScriptElement"]) {
+      const C = G[cn]; const d = C && Object.getOwnPropertyDescriptor(C.prototype, "href"); if (!d || !d.get) continue;
+      Object.defineProperty(C.prototype, "href", { configurable: true, enumerable: d.enumerable, get() {
+        const real = d.get.call(this);
+        return new Proxy(real, { get(t, k) {
+          if (k === "baseVal" || k === "animVal") { const v = t[k]; return typeof v === "string" ? core.unrewrite(v) : v; }
+          const v = t[k]; return typeof v === "function" ? v.bind(t) : v;
+        }, set(t, k, v) { t[k] = k === "baseVal" && typeof v === "string" ? R(v) : v; return true; } });
+      } });
     }
 
     for (const C of [HTMLIFrameElement, G.HTMLFrameElement, G.HTMLObjectElement, G.HTMLEmbedElement]) {
@@ -927,6 +982,11 @@
       return cur().origin;
     });
     for (const C of [HTMLImageElement, HTMLSourceElement]) setter(C.prototype, "srcset", (v) => core.rewriteSrcset(String(v), base()));
+    if (G.FontFace) {                                             // @font-face src ("url(...) format(...)") is CSS, same url() rewriting as any other CSS
+      G.FontFace = new Proxy(FontFace, {
+        construct(t, a, nt) { if (typeof a[1] === "string") a[1] = core.rewriteCSS(a[1], base()); return Reflect.construct(t, a, nt === undefined ? t : nt); },
+      });
+    }
     // Subresource Integrity: our rewritten scripts/styles can never match the site's hash, and sites often set it
     // from JS (`s.integrity = "sha384-…"` — e.g. Google's recaptcha loader on the "unusual traffic" page).
     // Swallow the value (still readable back) so the browser never enforces it.
@@ -937,6 +997,16 @@
         get() { return kept.has(this) ? kept.get(this) : ""; }, set(v) { kept.set(this, String(v)); } });
     }
     const URLA = new Set(["href", "src", "action", "poster", "data", "formaction", "background", "manifest"]);
+    // hide our own bootstrap entries (client.js / libcurl) from a page's own performance measurements, and show
+    // real site URLs rather than /fastsw/service/… in PerformanceEntry.name
+    if (G.PerformanceEntry) getter(PerformanceEntry.prototype, "name", (v) => core.unrewrite(v));
+    safe(() => {
+      const ownAsset = (e) => { const n = safe(() => String(e.name), ""); return n.indexOf(cfg.clientPath) >= 0 || n.indexOf(cfg.libcurlJS) >= 0; };
+      for (const m of ["getEntries", "getEntriesByType"]) {
+        const o = Performance.prototype[m]; if (!o) continue;
+        Performance.prototype[m] = function (...a) { return o.apply(this, a).filter((e) => !ownAsset(e)); };
+      }
+    });
     if (G.Attr) setter(Attr.prototype, "value", (v, a) => (URLA.has(a.name.toLowerCase()) ? R(v) : v));
     const E = Element.prototype, sa = E.setAttribute, ga = E.getAttribute;
     E.setAttribute = function (n, v) {
@@ -973,6 +1043,7 @@
       E.setAttributeNS = function (ns, n, v) { const l = String(n).toLowerCase().replace(/^.*:/, ""); return o.call(this, ns, n, URLA.has(l) ? R(String(v)) : v); };
     });
     getter(Attr.prototype, "value", (v, a) => (typeof v === "string" && URLA.has(a.name.toLowerCase()) ? core.unrewrite(v) : v));
+    getter(Attr.prototype, "nodeValue", (v, a) => (typeof v === "string" && URLA.has(a.name.toLowerCase()) ? core.unrewrite(v) : v));
 
     // dynamic scripts / styles
     const rjs = (el, v) => {
