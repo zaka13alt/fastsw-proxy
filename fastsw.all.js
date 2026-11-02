@@ -506,7 +506,20 @@
     const lurl = () => { const u = cur(); u.hash = realLoc.hash; return u; };
     const boot = G.__fastswBoot || {};
     const swc = safe(() => G.navigator.serviceWorker);
-    const post = (m) => { try { swc && swc.controller && swc.controller.postMessage(m); } catch (e) {} };
+    // cookie writes are acknowledged by the SW, and page-initiated navigations (location.replace / assign / href)
+    // wait for those acks: Google's challenge does `document.cookie = "SG_SS=…"; location.replace(…)` back to back,
+    // and the navigation request must already find the cookie in the SW's jar.
+    const acks = new Set();
+    const post = (m) => {
+      try {
+        if (!(swc && swc.controller)) return;
+        const ch = new MessageChannel();
+        const p = new Promise((res) => { ch.port1.onmessage = () => res(); setTimeout(res, 400); });
+        acks.add(p); p.then(() => acks.delete(p));
+        swc.controller.postMessage(m, [ch.port2]);
+      } catch (e) {}
+    };
+    const afterCookies = (fn) => (acks.size ? Promise.all([...acks]).then(fn, fn) : fn());
 
     /* ---------- fake Location (fastsw.location) ---------- */
     const L = {};
@@ -516,15 +529,15 @@
         get: () => lurl()[p],
         set: (v) => {
           if (p === "hash") { realLoc.hash = v; return; }
-          if (p === "href") { realLoc.href = R(v); return; }
+          if (p === "href") { const t = R(v); afterCookies(() => { realLoc.href = t; }); return; }
           if (p === "origin") return;
-          const u = lurl(); u[p] = v; realLoc.href = core.encode(u.href);
+          const u = lurl(); u[p] = v; const t = core.encode(u.href); afterCookies(() => { realLoc.href = t; });
         },
       });
     }
-    L.assign = (v) => realLoc.assign(R(v));
-    L.replace = (v) => realLoc.replace(R(v));
-    L.reload = () => realLoc.reload();
+    L.assign = (v) => { const t = R(v); afterCookies(() => realLoc.assign(t)); };
+    L.replace = (v) => { const t = R(v); afterCookies(() => realLoc.replace(t)); };
+    L.reload = () => { afterCookies(() => realLoc.reload()); };
     L.toString = () => lurl().href;
     L.valueOf = () => lurl().href;
     L.ancestorOrigins = [];
@@ -532,13 +545,33 @@
 
     /* ---------- fastsw object: dummy top / parent / location so pages can't bust out ---------- */
     const isFast = (w) => safe(() => !!w.fastsw, false);
+
+    // eval: handles strings AND TrustedScript objects. Google's challenge (the SG_REL page) does
+    //   (0, eval)(trustedTypesPolicy.createScript(code))
+    // so a version that only accepted `typeof x === "string"` returned the TrustedScript untouched and the
+    // challenge silently never ran. window.eval itself is wrapped too, so `window.eval(...)` / `self.eval(...)`
+    // / `E.eval(...)` (member calls the rewriter can't see) get rewritten as well. Indirect (global) eval semantics.
+    const nativeEval = G.eval;
+    const isTrusted = (x) => safe(() => !!(G.TrustedScript && x instanceof G.TrustedScript), false);
+    const evalFn = {                                                  // method shorthand: `function eval(){}` is illegal in strict mode
+      eval(x) {
+        if (typeof x === "string" || isTrusted(x)) x = core.rewriteJS(String(x), base());
+        return nativeEval.call(G, x);
+      },
+    }.eval;
+    safe(() => Object.defineProperty(G, "eval", { value: evalFn, writable: true, configurable: true, enumerable: false }));
+    for (const n of ["setTimeout", "setInterval"]) {                 // string handlers are code too
+      const o = G[n]; if (typeof o !== "function") continue;
+      G[n] = function (h, ...r) { if (typeof h === "string") h = core.rewriteJS(h, base()); return o.call(this === undefined || this === null ? G : this, h, ...r); };
+    }
+
     const fastsw = {
       get location() { return L; },
       set location(v) { L.href = v; },            // bare `location = "..."` in page scripts must navigate, not clobber the dummy
       get top() { let w = G; safe(() => { while (w.parent !== w && isFast(w.parent)) w = w.parent; }); return w; },
       get parent() { return safe(() => (G.parent !== G && isFast(G.parent) ? G.parent : G), G); },
       get self() { return G; },
-      eval: (x) => (typeof x === "string" ? (0, G.eval)(core.rewriteJS(x, base())) : x),
+      eval: evalFn,
       import: (b, spec, opts) => (opts === undefined ? import(core.rewriteURL(String(spec), b)) : import(core.rewriteURL(String(spec), b), opts)),
       meta: (m) => Object.assign({}, m, { url: core.unrewrite(m.url) }),
       Function: new Proxy(Function, {
@@ -894,6 +927,7 @@
       map: new Map(),
       timer: 0,
       persist() { clearTimeout(this.timer); this.timer = setTimeout(() => idb("readwrite", (s) => s.put([...this.map], "cookies")).catch(() => {}), 100); },
+      loaded() { return this._p || (this._p = this.load()); },       // load saved cookies once (before any persist can overwrite them)
       async load() { try { const a = await idb("readonly", (s) => s.get("cookies")); if (a) for (const [k, c] of a) if (!this.map.has(k)) this.map.set(k, c); } catch (e) {} },   // merge: never drop cookies set before the load finished
       set(url, line) {
         const u = new URL(url);
@@ -933,7 +967,7 @@
     const ensureReady = () => readyP || (readyP = (async () => {
       await libcurl.load_wasm("");                      // wasm is bundled in libcurl_full.js; resolves when ready
       libcurl.set_websocket(WISP);
-      await jar.load();
+      await jar.loaded();
     })().catch((e) => { readyP = null; throw e; }));   // retry on next request if the wasm / Wisp setup failed
 
     /* ---------------- header policy ---------------- */
@@ -1094,7 +1128,13 @@
     self.addEventListener("fetch", (e) => e.respondWith(handle(e)));
     self.addEventListener("message", (e) => {
       const d = e.data;
-      if (d && d.type === "fastsw:cookie") { try { jar.set(d.url, d.cookie); } catch (err) {} }
+      if (d && d.type === "fastsw:cookie") {
+        const port = e.ports && e.ports[0];
+        e.waitUntil((async () => {
+          try { await jar.loaded(); jar.set(d.url, d.cookie); } catch (err) {}
+          try { port && port.postMessage(1); } catch (err) {}      // ack: the page may now navigate
+        })());
+      }
     });
 
   /* ================================================================== *
