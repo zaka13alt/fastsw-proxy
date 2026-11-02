@@ -16,11 +16,27 @@
   /* ------------------------------------------------------------------ *
    *  CONFIG
    * ------------------------------------------------------------------ */
+  // Everything the service worker owns lives under  <directory of THIS script>/fastsw/  — so the worker can always be
+  // registered with that scope (a script at /src/fastsw.all.js may only claim scopes under /src/, never "/").
+  const BASE = (() => {
+    try {
+      let u;
+      if (typeof document !== "undefined") {
+        u = document.currentScript && document.currentScript.src;
+        if (!u) for (const s of Array.from(document.scripts || [])) if (/fastsw[^\/]*\.js(?:[?#]|$)/i.test(s.src)) u = s.src;
+      } else if (self.location) u = self.location.href;
+      if (u) { const p = new URL(u, self.location.href).pathname; return p.slice(0, p.lastIndexOf("/") + 1); }
+    } catch (e) {}
+    return "/";
+  })();
   const CONFIG = {
-    prefix: "/fastsw/service/",          // proxied URLs look like  /fastsw/service/<encodeURIComponent(url)>
-    clientPath: "/fastsw/client.js",     // runtime injected into every proxied document
+    base: BASE,
+    scope: BASE + "fastsw/",             // service worker scope: <script dir>/fastsw/   (override with Fastsw.register({ scope }))
+    prefix: BASE + "fastsw/service/",    // proxied URLs look like  <script dir>/fastsw/service/<encodeURIComponent(url)>
+    clientPath: BASE + "fastsw/client.js", // runtime injected into every proxied document
+    debugPath: BASE + "fastsw/debug",
     wisp: "wss://zakaon.top/wisp/",      // your Wisp server (null = same host, /wisp/)
-    // Single-file libcurl build (WASM bundled inside) hosted on YOUR origin: put libcurl_full.js in /fastsw/.
+    // Single-file libcurl build (WASM bundled inside) hosted on YOUR origin: put libcurl_full.js in /dist/.
     // Acorn (the JS parser) is embedded in this file, so there's nothing else to host.
     libcurlJS: "/dist/libcurl_full.js",
     pageWebSocket: true,                 // inject libcurl into pages so WebSocket() goes through Wisp
@@ -1676,7 +1692,7 @@
       const req = e.request, u = new URL(req.url);
       try {
         if (u.origin === ORIGIN && u.pathname === CONFIG.clientPath) return clientScript();
-        if (u.origin === ORIGIN && u.pathname === "/fastsw/debug") return debugPage(u);
+        if (u.origin === ORIGIN && u.pathname === CONFIG.debugPath) return debugPage(u);
         if (u.origin === ORIGIN && ASSET_PATHS.has(u.pathname)) return fetch(req);        // self-hosted libcurl: serve as-is, never proxy
         // YOUR host's own files (CONFIG.bypass): never proxied, never resolved against a proxied page
         if (u.origin === ORIGIN && isBypass(u.pathname)) return fetch(req);
@@ -1725,9 +1741,9 @@
             if (!page) return new Response("FastSW: cannot resolve relative URL " + target, { status: 400 });
             target = new URL(target + u.search, page).href;
           }
-        } else if (u.origin === ORIGIN && u.pathname.startsWith("/fastsw/") && (page = await findPage())) {
-          // `../x` from a proxied page resolves to /fastsw/x (one level above /fastsw/service/): undo that
-          target = new URL("../" + u.pathname.slice("/fastsw/".length) + u.search, page).href;
+        } else if (u.origin === ORIGIN && u.pathname.startsWith(CONFIG.scope) && (page = await findPage())) {
+          // `../x` from a proxied page resolves to <scope>x (one level above .../service/): undo that
+          target = new URL("../" + u.pathname.slice(CONFIG.scope.length) + u.search, page).href;
         } else {
           // request escaped the rewriter: resolve it against whichever proxied page made it
           page = page || (await findPage());
@@ -1762,7 +1778,7 @@
    *  Page side (index.html)
    * ================================================================== */
   } else if (typeof window !== "undefined") {
-    const SELF_SRC = (document.currentScript && document.currentScript.src) || "/fastsw.all.js";
+    const SELF_SRC = (document.currentScript && document.currentScript.src) || (() => { for (const s of Array.from(document.scripts || [])) if (/fastsw[^\/]*\.js(?:[?#]|$)/i.test(s.src)) return s.src; return "/fastsw.all.js"; })();
     const encode = (u) => { const i = u.indexOf("#"); return CONFIG.prefix + encodeURIComponent(i < 0 ? u : u.slice(0, i)) + (i < 0 ? "" : u.slice(i)); };
 
     /** address-bar text -> absolute URL (or a search URL) */
@@ -1774,10 +1790,25 @@
       return search.replace("%s", encodeURIComponent(input));
     };
     const DEFAULT_SEARCH = "https://duckduckgo.com/?q=%s";
-    const register = async () => {
+    /** Register the worker under <script dir>/fastsw/ by default (always allowed for the script's own location).
+     *  Pass { scope: "/" } only if your host sends  Service-Worker-Allowed: /  for this script. */
+    const register = async ({ scope } = {}) => {
       if (!("serviceWorker" in navigator)) throw new Error("Service workers are not supported (need https:// or localhost).");
-      await navigator.serviceWorker.register(SELF_SRC, { scope: "/", updateViaCache: "none" });
-      await navigator.serviceWorker.ready;
+      const reg = await navigator.serviceWorker.register(SELF_SRC, { scope: scope || CONFIG.scope, updateViaCache: "none" });
+      // navigator.serviceWorker.ready only resolves for registrations that cover THIS page; the frontend page usually lives outside the
+      // worker's scope, so wait on the registration itself
+      const w = reg.installing || reg.waiting;
+      if (!reg.active && w) await new Promise((res, rej) => {
+        const f = () => { if (w.state === "activated") res(); else if (w.state === "redundant") rej(new Error("FastSW service worker failed to install")); };
+        w.addEventListener("statechange", f); f();
+      });
+      // an older registration of this same script at "/" (previous versions) would keep fighting the new one: retire it
+      try {
+        const me = SELF_SRC.split("?")[0];
+        for (const r of await navigator.serviceWorker.getRegistrations())
+          if (r.scope !== reg.scope && [r.active, r.waiting, r.installing].some((x) => x && x.scriptURL.split("?")[0] === me)) await r.unregister();
+      } catch (e) {}
+      return reg;
     };
 
     /**
