@@ -22,7 +22,7 @@
     wisp: "wss://zakaon.top/wisp/",      // your Wisp server (null = same host, /wisp/)
     // Single-file libcurl build (WASM bundled inside) hosted on YOUR origin: put libcurl_full.js in /fastsw/.
     // Acorn (the JS parser) is embedded in this file, so there's nothing else to host.
-    libcurlJS: "/fastsw/libcurl_full.js",
+    libcurlJS: "/dist/libcurl_full.js",
     pageWebSocket: true,                 // inject libcurl into pages so WebSocket() goes through Wisp
     // Paths on YOUR OWN host that the service worker must never touch (your site's css / images / extra pages).
     // Exact path, or a prefix if it ends with "/".  e.g.  ["/assets/", "/favicon.ico", "/about.html"]
