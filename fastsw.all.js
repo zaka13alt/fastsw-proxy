@@ -559,6 +559,18 @@
     if (typeof document !== "undefined" && realLoc.search && realLoc.pathname.startsWith(cfg.prefix)) {
       try { History.prototype.replaceState.call(G.history, G.history.state, "", core.encode(cur().href) + realLoc.hash); } catch (e) {}
     }
+    const NAT_PROTOS = ["Document", "Element", "Node", "HTMLElement", "ShadowRoot", "XMLHttpRequest", "History", "Navigator", "WorkerNavigator", "ServiceWorkerContainer",
+      "CSSStyleDeclaration", "CSSStyleSheet", "IDBFactory", "MessageEvent", "Attr", "HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
+      "HTMLImageElement", "HTMLScriptElement", "HTMLStyleElement", "HTMLIFrameElement", "HTMLFrameElement", "HTMLMediaElement",
+      "HTMLSourceElement", "HTMLTrackElement", "HTMLEmbedElement", "HTMLObjectElement", "HTMLInputElement", "HTMLFormElement", "HTMLVideoElement",
+      "HTMLButtonElement", "DOMParser", "Range"];
+    const natTargets = () => { const t = [G, Object.prototype]; for (const n of NAT_PROTOS) if (G[n] && G[n].prototype) t.push(G[n].prototype); return t; };
+    const snap = new Map();                      // original function.length of every native we may patch, taken BEFORE patching
+    safe(() => { for (const o of natTargets()) {
+      const m = new Map();
+      for (const k of Reflect.ownKeys(o)) { let d; try { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { continue; } if (d) m.set(k, [d.value && d.value.length, d.get && d.get.length, d.set && d.set.length]); }
+      snap.set(o, m);
+    } });
     const boot = G.__fastswBoot || {};
     const swc = safe(() => G.navigator.serviceWorker);
     // cookie writes are acknowledged by the SW, and page-initiated navigations (location.replace / assign / href)
@@ -769,24 +781,27 @@
       safe(() => {
         const FTS = Function.prototype.toString, masked = new WeakMap();
         const NATIVE = /\{\s*\[native code\]\s*\}\s*$/;
-        const nat = (f, label) => {
+        const nat = (f, label, len) => {
           if (typeof f !== "function" || masked.has(f)) return;
-          try { if (!NATIVE.test(FTS.call(f))) masked.set(f, `function ${label}() { [native code] }`); } catch (e) {}
+          try {
+            if (!NATIVE.test(FTS.call(f))) {
+              masked.set(f, `function ${label}() { [native code] }`);
+              // name / length must match the native too (fetch.length === 1, fetch.name === "fetch", ...)
+              Object.defineProperty(f, "name", { value: label, configurable: true });
+              if (len !== undefined) Object.defineProperty(f, "length", { value: len, configurable: true });
+            }
+          } catch (e) {}
         };
-        const targets = [G, Object.prototype];
-        for (const n of ["Document", "Element", "Node", "HTMLElement", "ShadowRoot", "XMLHttpRequest", "History", "Navigator", "WorkerNavigator", "ServiceWorkerContainer",
-          "CSSStyleDeclaration", "CSSStyleSheet", "IDBFactory", "MessageEvent", "Attr", "HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
-          "HTMLImageElement", "HTMLScriptElement", "HTMLStyleElement", "HTMLIFrameElement", "HTMLFrameElement", "HTMLMediaElement",
-          "HTMLSourceElement", "HTMLTrackElement", "HTMLEmbedElement", "HTMLObjectElement", "HTMLInputElement", "HTMLFormElement", "HTMLVideoElement"])
-          if (G[n] && G[n].prototype) targets.push(G[n].prototype);
+        const targets = natTargets();
         for (const o of targets) {
           for (const k of Reflect.ownKeys(o)) {
             let d; try { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { continue; }
             if (!d) continue;
             const nm = typeof k === "symbol" ? `[${k.description}]` : k;
-            if (d.get) nat(d.get, "get " + nm);
-            if (d.set) nat(d.set, "set " + nm);
-            if (typeof d.value === "function" && k !== "constructor") nat(d.value, nm);
+            const sn = (snap.get(o) || new Map()).get(k) || [];
+            if (d.get) nat(d.get, "get " + nm, sn[1]);
+            if (d.set) nat(d.set, "set " + nm, sn[2]);
+            if (typeof d.value === "function" && k !== "constructor") nat(d.value, nm, sn[0]);
           }
         }
         // non-native functions: show their ORIGINAL source (undo our location/top/parent/eval rewrites)
@@ -1162,6 +1177,24 @@
       return again;
     }
 
+    const refPolicy = new Map();                         // page URL -> Referrer-Policy the site sent (header is stripped from the response)
+    function refererFor(page, t, pol) {
+      let p; try { p = new URL(page); } catch (e) { return null; }
+      p.hash = ""; p.username = ""; p.password = "";
+      const full = p.href.length > 4096 ? p.origin + "/" : p.href, orig = p.origin + "/";
+      const same = p.origin === t.origin, down = p.protocol === "https:" && t.protocol === "http:";
+      switch (String(pol).toLowerCase().split(",").pop().trim()) {
+        case "no-referrer": return null;
+        case "origin": return orig;
+        case "unsafe-url": return full;
+        case "same-origin": return same ? full : null;
+        case "origin-when-cross-origin": return same ? full : orig;
+        case "no-referrer-when-downgrade": return down ? null : full;
+        case "strict-origin": return down ? null : orig;
+        default: return down ? null : same ? full : orig;
+      }
+    }
+
     /* ---------------- the proxy request ---------------- */
     async function proxy(req, target, page) {
       await ensureReady();
@@ -1175,7 +1208,11 @@
       const dflt = (k, v) => { if (v != null && !(k in h)) h[k] = v; };
       const nv = self.navigator, uaStr = nv.userAgent, uad = nv.userAgentData;
       dflt("user-agent", uaStr);
-      dflt("accept", nav ? "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7" : "*/*");
+      const dst = req.destination || "";
+      const docLike = nav || dst === "document" || dst === "iframe" || dst === "frame";
+      dflt("accept", docLike ? "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+        : dst === "image" ? "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+        : dst === "style" ? "text/css,*/*;q=0.1" : "*/*");
       dflt("accept-language", (nv.languages && nv.languages.length ? nv.languages : [nv.language || "en-US"]).map((l, i) => (i ? `${l};q=${Math.max(0.1, 1 - i * 0.1).toFixed(1)}` : l)).join(","));
       const cm = /Chrom(?:e|ium)\/(\d+)/.exec(uaStr);
       if (uad && uad.brands && uad.brands.length) {
@@ -1194,13 +1231,18 @@
           site = pu.origin === t.origin ? "same-origin" : reg(pu) === reg(t) ? "same-site" : "cross-site";
         } catch (e) { site = "cross-site"; }
       }
-      dflt("sec-fetch-dest", nav ? "document" : req.destination || "empty");
+      dflt("sec-fetch-dest", dst || (nav ? "document" : "empty"));        // iframes are "iframe", not "document"
       dflt("sec-fetch-mode", req.mode === "same-origin" ? "cors" : req.mode);
       dflt("sec-fetch-site", site);
-      if (nav) { dflt("sec-fetch-user", "?1"); dflt("upgrade-insecure-requests", "1"); }
+      if (nav) { if (dst === "document" || !dst) dflt("sec-fetch-user", "?1"); dflt("upgrade-insecure-requests", "1"); }   // Sec-Fetch-User only on top-level navigations
       if (page) {
-        h.referer = page;
-        if ((req.method !== "GET" && req.method !== "HEAD") || req.headers.has("origin")) h.origin = new URL(page).origin;
+        // the browser applies the Referrer-Policy before sending (default strict-origin-when-cross-origin: cross-origin
+        // requests carry only "https://site/"); we stripped the header, so apply it ourselves
+        const ref = refererFor(page, t, req.referrerPolicy || refPolicy.get(page.split("#")[0]) || "");
+        if (ref) h.referer = ref;
+        const po = new URL(page).origin;
+        if ((req.method !== "GET" && req.method !== "HEAD") || req.headers.has("origin") || (!nav && (req.mode === "cors" || req.mode === "same-origin") && po !== t.origin && (dst === "" || dst === "script" || dst === "worker" || dst === "font")))
+          h.origin = po;
       }
       const ck = jar.get(t.href, false);
       if (ck) h.cookie = ck;
@@ -1219,6 +1261,9 @@
       for (const [k, v] of raw) {
         const lk = k.toLowerCase();
         if (lk === "set-cookie") { sawCookie = true; jar.set(t.href, v); continue; }
+        if (lk === "referrer-policy" && (req.destination === "document" || req.destination === "iframe" || req.destination === "frame" || req.mode === "navigate")) {
+          refPolicy.set(t.href.split("#")[0], v); if (refPolicy.size > 300) refPolicy.delete(refPolicy.keys().next().value);
+        }
         if (STRIP.has(lk)) continue;
         if (lk === "location") { out.set("location", core.rewriteURL(v, t.href)); continue; }
         out.append(k, v);
