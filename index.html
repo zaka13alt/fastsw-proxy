@@ -7,53 +7,102 @@
   <style>
     :root { color-scheme: dark; --bg:#0b0d12; --panel:#141824; --line:#252b3b; --txt:#e6e8ee; --dim:#8b93a7; --acc:#5b8cff; }
     * { box-sizing: border-box; }
-    body { margin:0; min-height:100vh; display:grid; place-items:center; background:radial-gradient(1200px 600px at 50% -10%, #17203a, var(--bg)); color:var(--txt); font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
-    main { width:min(640px, 92vw); text-align:center; }
-    h1 { font-size:clamp(2.4rem,8vw,3.6rem); margin:0 0 .25rem; letter-spacing:-.03em; }
+    html, body { height: 100%; }
+    body { margin:0; display:flex; flex-direction:column; background:var(--bg); color:var(--txt); font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
+
+    /* toolbar */
+    .bar { display:flex; align-items:center; gap:.4rem; padding:.45rem .6rem; background:var(--panel); border-bottom:1px solid var(--line); }
+    .bar button { width:2.1rem; height:2.1rem; display:grid; place-items:center; background:transparent; color:var(--txt); border:0; border-radius:8px; font-size:1.05rem; cursor:pointer; }
+    .bar button:hover:not(:disabled) { background:#1e2436; }
+    .bar button:disabled { opacity:.35; cursor:default; }
+    form { flex:1; min-width:0; }
+    #q { width:100%; background:#0e121c; border:1px solid var(--line); border-radius:999px; color:inherit; font:inherit; padding:.4rem 1rem; outline:0; }
+    #q:focus { border-color:var(--acc); box-shadow:0 0 0 3px #5b8cff33; }
+    #title { max-width:22ch; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--dim); font-size:.85rem; }
+    @media (max-width: 640px) { #title { display:none; } }
+
+    /* stage */
+    .stage { position:relative; flex:1; min-height:0; }
+    #frame-host { position:absolute; inset:0; }
+    #frame-host iframe { background:#fff; }
+
+    /* start page (shown until the first navigation) */
+    #start { position:absolute; inset:0; display:grid; place-items:center; padding:1rem; background:radial-gradient(1200px 600px at 50% -10%, #17203a, var(--bg)); }
+    #start[hidden] { display:none; }
+    #start main { width:min(560px, 100%); text-align:center; }
+    h1 { font-size:clamp(2.4rem,8vw,3.4rem); margin:0 0 .25rem; letter-spacing:-.03em; }
     h1 span { color:var(--acc); }
-    p.sub { margin:0 0 1.75rem; color:var(--dim); }
-    form { display:flex; gap:.5rem; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:.5rem; }
-    form:focus-within { border-color:var(--acc); box-shadow:0 0 0 3px #5b8cff33; }
-    input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:inherit; font:inherit; padding:.6rem .75rem; }
-    button { background:var(--acc); color:#fff; border:0; border-radius:10px; padding:.6rem 1.1rem; font:inherit; font-weight:600; cursor:pointer; }
-    button:disabled { opacity:.5; cursor:wait; }
-    #status { margin-top:1rem; min-height:1.5em; color:var(--dim); font-size:.9rem; }
-    #status.err { color:#ff7b7b; }
-    .quick { margin-top:1.25rem; display:flex; flex-wrap:wrap; gap:.5rem; justify-content:center; }
+    .sub { margin:0 0 1.5rem; color:var(--dim); }
+    .quick { display:flex; flex-wrap:wrap; gap:.5rem; justify-content:center; }
     .quick a { color:var(--dim); text-decoration:none; border:1px solid var(--line); border-radius:999px; padding:.25rem .8rem; font-size:.85rem; }
     .quick a:hover { color:var(--txt); border-color:var(--acc); }
+    #status { margin-top:1rem; min-height:1.5em; color:var(--dim); font-size:.9rem; }
+    #status.err { color:#ff7b7b; }
   </style>
 </head>
 <body>
-  <main>
-    <h1>Fast<span>SW</span></h1>
-    <p class="sub">Service-worker web proxy · libcurl.js + Wisp</p>
-
+  <div class="bar">
+    <button id="back"    title="Back"    aria-label="Back"    disabled>&#8592;</button>
+    <button id="forward" title="Forward" aria-label="Forward" disabled>&#8594;</button>
+    <button id="reload"  title="Reload"  aria-label="Reload"  disabled>&#8635;</button>
     <form id="f" autocomplete="off">
-      <input id="q" type="text" placeholder="Search or enter a URL" autofocus spellcheck="false">
-      <button id="go" type="submit" disabled>Go</button>
+      <input id="q" type="text" placeholder="Search or enter a URL" spellcheck="false" autofocus>
     </form>
-    <div id="status">Starting service worker…</div>
+    <span id="title"></span>
+  </div>
 
-    <div class="quick">
-      <a href="#" data-u="https://duckduckgo.com">DuckDuckGo</a>
-      <a href="#" data-u="https://wikipedia.org">Wikipedia</a>
-      <a href="#" data-u="https://example.com">example.com</a>
+  <div class="stage">
+    <div id="frame-host"></div>
+    <div id="start">
+      <main>
+        <h1>Fast<span>SW</span></h1>
+        <p class="sub">Service-worker web proxy · libcurl.js + Wisp</p>
+        <div class="quick">
+          <a href="#" data-u="https://duckduckgo.com">DuckDuckGo</a>
+          <a href="#" data-u="https://wikipedia.org">Wikipedia</a>
+          <a href="#" data-u="https://example.com">example.com</a>
+        </div>
+        <div id="status">Starting service worker…</div>
+      </main>
     </div>
-  </main>
+  </div>
 
   <script src="/fastsw.all.js"></script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const status = $("status"), go = $("go"), q = $("q");
+    const q = $("q"), status = $("status"), start = $("start");
+    const nav = [$("back"), $("forward"), $("reload")];
 
-    Fastsw.register()
-      .then(() => { status.textContent = "Ready."; go.disabled = false; })
+    // One proxied <iframe>, created by FastSW. It registers the service worker itself.
+    const frame = Fastsw.createFrame({ container: $("frame-host") });
+
+    frame.ready
+      .then(() => { status.textContent = "Ready."; nav.forEach((b) => (b.disabled = false)); })
       .catch((e) => { status.textContent = e.message; status.className = "err"; });
 
-    $("f").addEventListener("submit", (e) => { e.preventDefault(); Fastsw.go(q.value); });
+    // keep the address bar and title in sync with whatever the page is really showing
+    frame.addEventListener("urlchange", (e) => {
+      if (document.activeElement !== q) q.value = e.detail.url;
+      document.title = (frame.title ? frame.title + " · " : "") + "FastSW";
+    });
+    frame.addEventListener("navigate", () => { $("title").textContent = frame.title; document.title = (frame.title ? frame.title + " · " : "") + "FastSW"; });
+
+    function open(input) {
+      if (!String(input).trim()) return;
+      start.hidden = true;
+      frame.go(input);
+    }
+
+    $("f").addEventListener("submit", (e) => { e.preventDefault(); open(q.value); q.blur(); });
     document.querySelectorAll(".quick a").forEach((a) =>
-      a.addEventListener("click", (e) => { e.preventDefault(); if (!go.disabled) Fastsw.go(a.dataset.u); }));
+      a.addEventListener("click", (e) => { e.preventDefault(); open(a.dataset.u); }));
+    $("back").onclick = () => frame.back();
+    $("forward").onclick = () => frame.forward();
+    $("reload").onclick = () => frame.reload();
+
+    // optional: open a site straight from the address bar:  /?url=example.com
+    const initial = new URLSearchParams(location.search).get("url");
+    if (initial) open(initial);
   </script>
 </body>
 </html>
