@@ -589,7 +589,7 @@
       "CSSStyleDeclaration", "CSSStyleSheet", "IDBFactory", "MessageEvent", "Attr", "HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
       "HTMLImageElement", "HTMLScriptElement", "HTMLStyleElement", "HTMLIFrameElement", "HTMLFrameElement", "HTMLMediaElement",
       "HTMLSourceElement", "HTMLTrackElement", "HTMLEmbedElement", "HTMLObjectElement", "HTMLInputElement", "HTMLFormElement", "HTMLVideoElement",
-      "HTMLButtonElement", "DOMParser", "Range"];
+      "HTMLButtonElement", "DOMParser", "Range", "WebSocket"];
     const natTargets = () => { const t = [G, Object.prototype]; for (const n of NAT_PROTOS) if (G[n] && G[n].prototype) t.push(G[n].prototype); return t; };
     const snap = new Map();                      // original function.length of every native we may patch, taken BEFORE patching
     safe(() => { for (const o of natTargets()) {
@@ -762,17 +762,114 @@
     ["EventSource", "Request", "Audio"].forEach((n) => ctor(n, false));
     if (!isWin && G.importScripts) { const oi = G.importScripts; G.importScripts = (...a) => oi.apply(G, a.map(R)); }
 
-    // WebSockets go through libcurl.js -> Wisp
-    if (isWin && cfg.pageWebSocket && LC && LC.WebSocket) {
+    // WebSockets go through libcurl.js -> Wisp. libcurl's FakeWebSocket is only a rough imitation (close events carry no
+    // code/reason, blob frames are built wrong, no Origin header, throws before the wasm is ready), and sites like Discord's
+    // gateway key their reconnect logic off exactly those details. So the real WebSocket constructor/prototype stay in
+    // place (instanceof, prototype chain, statics) and instances created here are backed by a libcurl socket.
+    if (isWin && cfg.pageWebSocket && LC && LC.WebSocket && G.WebSocket) {
       const wisp = cfg.wisp || (G.location.protocol === "https:" ? "wss:" : "ws:") + "//" + G.location.host + "/wisp/";
-      // single-file build: the wasm is bundled, the argument is ignored but load_wasm() still resolves when ready
-      safe(() => Promise.resolve(LC.load_wasm("")).then(() => LC.set_websocket(wisp)).catch(() => {}));
-      const NativeWS = G.WebSocket;
-      G.WebSocket = new Proxy(NativeWS, {
-        construct(t, a) {
-          try { return new LC.WebSocket(a[0], a[1]); } catch (e) { return Reflect.construct(t, a); }
+      let wsReady = false; const wsWait = [];
+      const wsGo = () => { wsReady = true; wsWait.splice(0).forEach((f) => f()); };
+      try { Promise.resolve(LC.load_wasm("")).then(() => { try { LC.set_websocket(wisp); } catch (e) {} wsGo(); }, wsGo); } catch (e) { wsGo(); }
+      const NativeWS = G.WebSocket, WP = NativeWS.prototype, WS = new WeakMap();
+      const rep = (e) => { try { (G.reportError || ((x) => setTimeout(() => { throw x; })))(e); } catch (x) {} };
+      const fire = (self, st, type, init) => {
+        let ev;
+        if (type === "message") ev = new MessageEvent("message", init);
+        else if (type === "close") ev = new CloseEvent("close", init);
+        else ev = new Event(type);
+        EventTarget.prototype.dispatchEvent.call(self, ev);
+        const h = st.on[type]; if (typeof h === "function") { try { h.call(self, ev); } catch (e) { rep(e); } }
+      };
+      const fin = (self, st, code, reason, clean) => {
+        if (st.done) return; st.done = true; st.rs = 3; clearTimeout(st.timer);
+        if (!st.opened) fire(self, st, "error");
+        fire(self, st, "close", { code, reason: reason || "", wasClean: !!clean });
+        try { st.inner && st.inner.close(); } catch (e) {}
+      };
+      const start = (self, st) => {
+        if (st.done) return;
+        let inner;
+        try {
+          const hdr = { Origin: cur().origin }; const ua = safe(() => G.navigator.userAgent); if (ua) hdr["User-Agent"] = ua;
+          inner = new LC.WebSocket(st.url, st.protocols.length ? st.protocols : null, { headers: hdr });
+        } catch (e) { fin(self, st, 1006, "", false); return; }
+        try { inner.binaryType = "arraybuffer"; } catch (e) {}
+        st.inner = inner;
+        inner.addEventListener("open", () => {
+          if (st.done) return;
+          st.opened = true;
+          if (st.closeReq) { try { inner.close(); } catch (e) {} return; }
+          st.rs = 1; fire(self, st, "open");
+        });
+        inner.addEventListener("message", (e) => {
+          if (st.done || st.rs > 2) return;
+          let d = e.data;
+          if (typeof d !== "string") d = st.bt === "blob" ? new Blob([d]) : d;
+          fire(self, st, "message", { data: d });
+        });
+        inner.addEventListener("error", () => fin(self, st, 1006, "", false));
+        inner.addEventListener("close", () => {
+          if (st.closeReq && st.opened) fin(self, st, st.closeReq.code, st.closeReq.reason, true);
+          else fin(self, st, 1006, "", false);
+        });
+      };
+      const make = (args, nt) => {
+        if (args.length < 1) throw new TypeError("Failed to construct 'WebSocket': 1 argument required, but only 0 present.");
+        let u; try { u = new URL(String(args[0]), base()); } catch (e) { throw new DOMException(`Failed to construct 'WebSocket': The URL '${args[0]}' is invalid.`, "SyntaxError"); }
+        if (u.protocol === "http:") u.protocol = "ws:"; else if (u.protocol === "https:") u.protocol = "wss:";
+        if (u.protocol !== "ws:" && u.protocol !== "wss:") throw new DOMException(`Failed to construct 'WebSocket': The URL's scheme must be either 'http', 'https', 'ws', or 'wss'. '${u.protocol.slice(0, -1)}' is not allowed.`, "SyntaxError");
+        if (u.hash) throw new DOMException(`Failed to construct 'WebSocket': The URL contains a fragment identifier ('${u.hash}'). Fragment identifiers are not allowed in WebSocket URLs.`, "SyntaxError");
+        let pr = args[1] === undefined ? [] : typeof args[1] === "string" ? [args[1]] : Array.from(args[1], String);
+        if (new Set(pr).size !== pr.length) throw new DOMException("Failed to construct 'WebSocket': The subprotocol '" + pr.find((x, i) => pr.indexOf(x) !== i) + "' is duplicated.", "SyntaxError");
+        const self = Reflect.construct(EventTarget, [], nt || NativeWS);
+        const st = { url: u.href, protocols: pr, rs: 0, bt: "blob", on: {}, inner: null, closeReq: null, done: false, opened: false, pend: 0, q: Promise.resolve(), timer: 0 };
+        WS.set(self, st);
+        if (wsReady) start(self, st); else wsWait.push(() => start(self, st));
+        return self;
+      };
+      const impl = {
+        send(self, st, d) {
+          if (st.rs === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", "InvalidStateError");
+          if (st.rs > 1 || !st.inner) return;
+          const go = (x) => { if (!st.done && st.inner) try { st.inner.send(x); } catch (e) {} };
+          if (typeof Blob !== "undefined" && d instanceof Blob) {
+            st.pend++;
+            st.q = st.q.then(() => d.arrayBuffer()).then((ab) => go(new Uint8Array(ab))).catch(() => {}).then(() => { st.pend--; });
+            return;
+          }
+          const p = typeof d === "string" ? d : ArrayBuffer.isView(d) ? new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength)) : d instanceof ArrayBuffer ? new Uint8Array(d.slice(0)) : String(d);
+          if (st.pend) st.q = st.q.then(() => go(p)); else go(p);
         },
-      });
+        close(self, st, code, reason) {
+          if (code !== undefined) { code = Number(code); if (code !== 1000 && !(code >= 3000 && code <= 4999)) throw new DOMException(`Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. ${code} is neither.`, "InvalidAccessError"); }
+          if (reason !== undefined && new TextEncoder().encode(String(reason)).length > 123) throw new DOMException("Failed to execute 'close' on 'WebSocket': The message must not be greater than 123 bytes.", "SyntaxError");
+          if (st.rs >= 2) return;
+          st.closeReq = { code: code === undefined ? 1005 : code, reason: reason === undefined ? "" : String(reason) };
+          st.rs = 2;
+          if (!st.inner) { fin(self, st, 1006, "", false); return; }
+          try { st.inner.close(); } catch (e) {}
+          st.timer = setTimeout(() => fin(self, st, st.closeReq.code, st.closeReq.reason, st.opened), 3000);
+        },
+      };
+      const acc = (k, g, s) => {
+        const d = Object.getOwnPropertyDescriptor(WP, k); if (!d) return;
+        Object.defineProperty(WP, k, { configurable: true, enumerable: d.enumerable,
+          get: d.get && { [k]() { const st = WS.get(this); return st ? g(st, this) : d.get.call(this); } }[k],
+          set: d.set && { [k](v) { const st = WS.get(this); if (st) s(st, v); else d.set.call(this, v); } }[k] });
+      };
+      acc("readyState", (st) => st.rs);
+      acc("url", (st) => st.url);
+      acc("protocol", (st) => (st.opened ? "" : ""));
+      acc("extensions", () => "");
+      acc("bufferedAmount", () => 0);
+      acc("binaryType", (st) => st.bt, (st, v) => { v = String(v); if (v === "blob" || v === "arraybuffer") st.bt = v; });
+      for (const t of ["open", "message", "error", "close"]) acc("on" + t, (st) => (st.on[t] === undefined ? null : st.on[t]), (st, v) => { st.on[t] = typeof v === "function" ? v : null; });
+      for (const m of ["send", "close"]) {
+        const o = WP[m], dd = Object.getOwnPropertyDescriptor(WP, m); if (!dd || typeof o !== "function") continue;
+        Object.defineProperty(WP, m, { ...dd, value: { [m](...a) { const st = WS.get(this); return st ? impl[m](this, st, ...a) : o.apply(this, a); } }[m] });
+      }
+      G.WebSocket = new Proxy(NativeWS, { construct(t, a, nt) { return make(a, nt === G.WebSocket ? NativeWS : nt); } });
     }
 
     if (G.history) for (const m of ["pushState", "replaceState"]) {
