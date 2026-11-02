@@ -1218,10 +1218,42 @@
         if (d.sent) txt += "    sent: " + Object.entries(d.sent).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`).join("\n          ") + "\n";
         if (d.setCookies && d.setCookies.length) txt += "    set-cookie: " + d.setCookies.join(" | ") + "\n";
         if (d.location) txt += "    location: " + d.location + "\n";
-        if (d.jsbody) txt += "    BODY: " + d.jsbody + "\n";
+        if (d.jsbody) txt += "    BODY: " + d.jsbody.slice(0, 1500) + "\n";
+        if (d.frames) txt += "    CODE AT THE FAILING FRAMES (rewritten source):\n" + d.frames.map((f) => "    " + f).join("\n") + "\n";
         txt += "\n";
       }
       return new Response(txt, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+    }
+
+    // For Google-style error reports ("jserror" etc.): fetch the script named in the stack, rewrite it exactly as we serve it
+    // (stack positions refer to the REWRITTEN text) and keep the code around the failing line:column in the debug log.
+    const srcCache = new Map(), seenTrace = new Set();
+    function srcOf(url) {
+      if (!srcCache.has(url)) {
+        srcCache.set(url, (async () => {
+          await ensureReady();
+          const r = await curlFetch(url, { method: "GET", headers: { "user-agent": self.navigator.userAgent, accept: "*/*", "accept-language": "en-US,en;q=0.9" }, redirect: "follow" });
+          const raw = decodeText(await r.arrayBuffer(), "");
+          return { raw, rw: core.rewriteJS(raw, url) };
+        })());
+        if (srcCache.size > 8) srcCache.delete(srcCache.keys().next().value);
+      }
+      return srcCache.get(url);
+    }
+    const snip = (text, line, col, before, after) => {
+      const ls = text.split(/\r\n|[\n\r\u2028\u2029]/), l = ls[line - 1];
+      if (l == null) return `(line ${line} out of range; file has ${ls.length} lines)`;
+      const i = col - 1; return l.slice(Math.max(0, i - before), i) + "<<<HERE>>>" + l.slice(i, i + after);
+    };
+    async function explainTrace(ent, trace) {
+      const key = trace.slice(0, 400); if (seenTrace.has(key)) return; seenTrace.add(key);
+      ent.frames = [];
+      const re = /at (?:([^\n(]*?) \()?(https?:\/\/[^\s)]+?):(\d+):(\d+)(?=\)|\s|$)/g; let m, n = 0;
+      while ((m = re.exec(trace)) && n < 5) {
+        n++;
+        try { const sct = await srcOf(m[2]); ent.frames.push(`#${n} ${m[1] || "(anon)"}  ...${m[2].slice(-50)}:${m[3]}:${m[4]}\n    ${snip(sct.rw, +m[3], +m[4], 300, 160)}`); }
+        catch (e) { ent.frames.push(`#${n} (could not fetch ${m[2].slice(-50)}: ${e && e.message})`); }
+      }
     }
 
     /* ---------------- the proxy request ---------------- */
@@ -1303,9 +1335,11 @@
       safe0(() => {
         const sent = { ...h }; sent.cookie = cookieNames(h.cookie);
         const jb = /jserror|\/log\b|\/gen_204|\/error/i.test(t.pathname) && body ? (() => { const x = decodeText(body, ""); try { return decodeURIComponent(x.replace(/\+/g, " ")).slice(0, 4000); } catch (e) { return x.slice(0, 4000); } })() : undefined;
-        dbg({ jsbody: jb, method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent, page: page || "(none)", refIn: req.referrer, refPol: req.referrerPolicy,
+        const ent = { jsbody: jb, method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent, page: page || "(none)", refIn: req.referrer, refPol: req.referrerPolicy,
           setCookies: raw.filter(([k]) => k.toLowerCase() === "set-cookie").map(([, v]) => String(v).replace(/^([^=]+)=[^;]*/, "$1=<v>")),
-          location: (raw.find(([k]) => k.toLowerCase() === "location") || [])[1] });
+          location: (raw.find(([k]) => k.toLowerCase() === "location") || [])[1] };
+        dbg(ent);
+        if (jb && /^trace=/.test(jb)) explainTrace(ent, jb);
       });
 
       if (r.status >= 300 && r.status < 400 && out.has("location")) return new Response(null, { status: r.status, headers: out });
