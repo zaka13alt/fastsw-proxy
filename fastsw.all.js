@@ -571,6 +571,8 @@
       for (const k of Reflect.ownKeys(o)) { let d; try { d = Object.getOwnPropertyDescriptor(o, k); } catch (e) { continue; } if (d) m.set(k, [d.value && d.value.length, d.get && d.get.length, d.set && d.set.length]); }
       snap.set(o, m);
     } });
+    const rawLS = safe(() => G.localStorage);
+    const dbgOn = () => safe(() => rawLS && rawLS.getItem("__fastswDebug") === "1", false);
     const boot = G.__fastswBoot || {};
     const swc = safe(() => G.navigator.serviceWorker);
     // cookie writes are acknowledged by the SW, and page-initiated navigations (location.replace / assign / href)
@@ -818,7 +820,9 @@
           let head; try { head = String(err); } catch (e) { head = "Error"; }
           const lines = [];
           for (const f of frames) { const t = String(f); if (t.indexOf(cfg.clientPath) < 0) lines.push("    at " + t); }
-          return clean(head + (lines.length ? "\n" + lines.join("\n") : ""));
+          const full = clean(head + (lines.length ? "\n" + lines.join("\n") : ""));
+          if (/^(Type|Reference)Error: Cannot read properties of (null|undefined)|is not a function|is not defined/.test(head) && dbgOn()) { try { console.warn("[fastsw debug] " + full); } catch (e) {} }
+          return full;
         };
       });
     };
@@ -1214,6 +1218,7 @@
         if (d.sent) txt += "    sent: " + Object.entries(d.sent).map(([k, v]) => `${k}: ${String(v).slice(0, 160)}`).join("\n          ") + "\n";
         if (d.setCookies && d.setCookies.length) txt += "    set-cookie: " + d.setCookies.join(" | ") + "\n";
         if (d.location) txt += "    location: " + d.location + "\n";
+        if (d.jsbody) txt += "    BODY: " + d.jsbody + "\n";
         txt += "\n";
       }
       return new Response(txt, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
@@ -1297,7 +1302,8 @@
       out.set("access-control-allow-credentials", "true");
       safe0(() => {
         const sent = { ...h }; sent.cookie = cookieNames(h.cookie);
-        dbg({ method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent, page: page || "(none)", refIn: req.referrer, refPol: req.referrerPolicy,
+        const jb = /jserror|\/log\b|\/gen_204|\/error/i.test(t.pathname) && body ? (() => { const x = decodeText(body, ""); try { return decodeURIComponent(x.replace(/\+/g, " ")).slice(0, 4000); } catch (e) { return x.slice(0, 4000); } })() : undefined;
+        dbg({ jsbody: jb, method: req.method, url: t.href, dest: req.destination || "", mode: req.mode, nav: nav, status: r.status, sent, page: page || "(none)", refIn: req.referrer, refPol: req.referrerPolicy,
           setCookies: raw.filter(([k]) => k.toLowerCase() === "set-cookie").map(([, v]) => String(v).replace(/^([^=]+)=[^;]*/, "$1=<v>")),
           location: (raw.find(([k]) => k.toLowerCase() === "location") || [])[1] });
       });
